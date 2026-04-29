@@ -1,0 +1,354 @@
+/*
+ * tcodec_common.h — Internal shared declarations for TCodec
+ *
+ * Not part of the public API. Included by all internal source files.
+ */
+
+#ifndef TCODEC_COMMON_H
+#define TCODEC_COMMON_H
+
+#include "tcodec_types.h"
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+
+/* pthread is only needed for WPP thread pool in encoder/decoder.
+ * Not required for single-threaded API usage. */
+#if !defined(TCODEC_NO_THREADS)
+#include <pthread.h>
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ── Compiler hints ───────────────────────────────────────────── */
+
+#define TCODEC_UNUSED(x) ((void)(x))
+
+/* ── Clip / min / max ────────────────────────────────────────── */
+
+TCODEC_INLINE int tc_clip(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+TCODEC_INLINE int tc_min(int a, int b) { return a < b ? a : b; }
+TCODEC_INLINE int tc_max(int a, int b) { return a > b ? a : b; }
+TCODEC_INLINE int tc_abs(int v) { return v < 0 ? -v : v; }
+
+/* ── Fixed-point constants ────────────────────────────────────── */
+
+/* DCT uses 16-bit coefficients with 14-bit fractional precision.
+ * Values are stored as int16_t, range [-16384, 16383]. */
+#define TC_DCT_BITS      14
+#define TC_DCT_SCALE     (1 << TC_DCT_BITS)   /* 16384 */
+
+/* Quantization uses 16.16 fixed point for QP-to-scale mapping. */
+#define TC_QUANT_BITS    16
+#define TC_QUANT_SCALE   (1 << TC_QUANT_BITS)
+
+/* ── Bitstream reader/writer ─────────────────────────────────── */
+
+typedef struct tc_bs_writer {
+    uint8_t *buf;
+    size_t   capacity;
+    size_t   byte_pos;       /* Current byte position */
+    int      bit_pos;        /* Bit position within current byte (0..7) */
+} tc_bs_writer_t;
+
+typedef struct tc_bs_reader {
+    const uint8_t *buf;
+    size_t         size;
+    size_t         byte_pos;
+    int            bit_pos;
+} tc_bs_reader_t;
+
+void tc_bs_writer_init(tc_bs_writer_t *w, uint8_t *buf, size_t capacity);
+void tc_bs_writer_write_bits(tc_bs_writer_t *w, uint32_t val, int nbits);
+void tc_bs_writer_write_ue(tc_bs_writer_t *w, uint32_t val);  /* Exp-Golomb */
+void tc_bs_writer_write_se(tc_bs_writer_t *w, int32_t val);   /* Signed EG */
+void tc_bs_writer_byte_align(tc_bs_writer_t *w);
+size_t tc_bs_writer_bytes(tc_bs_writer_t *w);
+
+void tc_bs_reader_init(tc_bs_reader_t *r, const uint8_t *buf, size_t size);
+uint32_t tc_bs_reader_read_bits(tc_bs_reader_t *r, int nbits);
+uint32_t tc_bs_reader_read_ue(tc_bs_reader_t *r);
+int32_t  tc_bs_reader_read_se(tc_bs_reader_t *r);
+int      tc_bs_reader_eof(tc_bs_reader_t *r);
+
+/* ── Frame buffer management ─────────────────────────────────── */
+
+tc_frame_buf_t *tc_frame_alloc(int width, int height);
+void            tc_frame_free(tc_frame_buf_t *frame);
+void            tc_frame_copy(tc_frame_buf_t *dst, const tc_frame_buf_t *src);
+tc_frame_buf_t *tc_frame_clone(const tc_frame_buf_t *src);
+
+/* ── Color conversion ───────────────────────────────────────── */
+
+void tc_rgb_to_ycbcr_internal(const uint8_t *rgb, int rgb_stride,
+                               tc_pixel_t *y,  int stride_y,
+                               tc_pixel_t *cb, int stride_cb,
+                               tc_pixel_t *cr, int stride_cr,
+                               int width, int height);
+
+void tc_ycbcr_to_rgb_internal(const tc_pixel_t *y,  int stride_y,
+                               const tc_pixel_t *cb, int stride_cb,
+                               const tc_pixel_t *cr, int stride_cr,
+                               uint8_t *rgb, int rgb_stride,
+                               int width, int height);
+
+/* ── Transform ───────────────────────────────────────────────── */
+
+/* Forward DCT. Input: 8-bit pixels. Output: 16-bit coefficients.
+ * For 4×4: in = 4×4 block, out = 4×4 coefficients
+ * For 8×8: in = 8×8 block, out = 8×8 coefficients */
+void tc_fdct4x4(const tc_pixel_t *TCODEC_RESTRICT in, int stride,
+                tc_coeff_t *TCODEC_RESTRICT out);
+void tc_fdct8x8(const tc_pixel_t *TCODEC_RESTRICT in, int stride,
+                tc_coeff_t *TCODEC_RESTRICT out);
+
+/* Inverse DCT. Input: 16-bit coefficients. Output: 8-bit pixels (clipped). */
+void tc_idct4x4(const tc_coeff_t *TCODEC_RESTRICT in,
+                tc_pixel_t *TCODEC_RESTRICT out, int stride);
+void tc_idct8x8(const tc_coeff_t *TCODEC_RESTRICT in,
+                tc_pixel_t *TCODEC_RESTRICT out, int stride);
+
+/* Residual-mode Walsh-Hadamard Transform — self-inverting (H*H=n*I),
+ * operates on signed residuals without ±128 level shift.
+ * These are the primary functions used by the encoder/decoder pipeline.
+ * Forward and inverse use the SAME butterfly (H is its own inverse). */
+void tc_fwht4x4(const tc_coeff_t *TCODEC_RESTRICT in, int stride,
+                 tc_coeff_t *TCODEC_RESTRICT out);
+void tc_iwht4x4(const tc_coeff_t *TCODEC_RESTRICT in,
+                 tc_coeff_t *TCODEC_RESTRICT out, int stride);
+void tc_fwht8x8(const tc_coeff_t *TCODEC_RESTRICT in, int stride,
+                 tc_coeff_t *TCODEC_RESTRICT out);
+void tc_iwht8x8(const tc_coeff_t *TCODEC_RESTRICT in,
+                 tc_coeff_t *TCODEC_RESTRICT out, int stride);
+
+/* ── Quantization ────────────────────────────────────────────── */
+
+/* Quantize transform coefficients. Returns number of non-zero coefficients. */
+int tc_quantize(tc_coeff_t *TCODEC_RESTRICT coeffs, int n,
+                int qp, int band);
+
+/* Dequantize transform coefficients. */
+void tc_dequantize(tc_coeff_t *TCODEC_RESTRICT coeffs, int n,
+                   int qp, int band);
+
+/* Get quantization step size for given QP. */
+int tc_qscale(int qp);
+
+/* JND-based weight for a coefficient position in a band. */
+int tc_jnd_weight(int band, int pos);
+
+/* ── Entropy coding (Exp-Golomb, tANS reserved) ─────────────── */
+
+/* Encoder state — contexts removed (saved ~40KB), reserved for future ANS */
+typedef struct tc_tans_enc {
+    tc_bs_writer_t *bs;                  /* Output bitstream */
+    uint32_t        state;               /* Reserved for ANS state */
+} tc_tans_enc_t;
+
+/* Decoder state — contexts removed (saved ~40KB), reserved for future ANS */
+typedef struct tc_tans_dec {
+    tc_bs_reader_t *bs;                  /* Input bitstream */
+    uint32_t        state;               /* Reserved for ANS state */
+} tc_tans_dec_t;
+
+void tc_tans_enc_init(tc_tans_enc_t *e, tc_bs_writer_t *bs);
+void tc_tans_enc_flush(tc_tans_enc_t *e);
+
+void tc_tans_dec_init(tc_tans_dec_t *d, tc_bs_reader_t *bs);
+
+/* Frequency band classification for a zigzag position.
+ * Reserved for future JND-weighted quantization per coefficient.
+ * Currently quantize/dequantize always pass band=0. */
+int tc_freq_band(int pos, int blk_size);
+
+/* Coefficient coding helpers */
+void tc_tans_enc_coeffs(tc_tans_enc_t *e, const tc_coeff_t *coeffs, int n,
+                         tc_block_size_t dct_size);
+void tc_tans_dec_coeffs(tc_tans_dec_t *d, tc_coeff_t *coeffs, int n,
+                         tc_block_size_t dct_size);
+
+/* ── Intra prediction ─────────────────────────────────────────── */
+
+/* Build reference samples from reconstructed neighbors.
+ * ref_above[0..2n-1], ref_left[0..2n-1] for an n×n block.
+ * If neighbors aren't available (top row / left col), repeat from DC. */
+void tc_intra_get_ref(const tc_pixel_t *recon, int stride,
+                      int x, int y, int blk_size, int frame_w, int frame_h,
+                      tc_pixel_t *ref_above, tc_pixel_t *ref_left);
+
+/* Intra predict a block. mode is tc_intra_mode_t.
+ * dst stride is blk_size. */
+void tc_intra_predict(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
+                      const tc_pixel_t *ref_above,
+                      const tc_pixel_t *ref_left,
+                      int blk_size, tc_intra_mode_t mode);
+
+/* Rate-distortion cost for a candidate intra mode (fast SAD-based). */
+tc_sad_t tc_intra_cost(const tc_pixel_t *orig, int orig_stride,
+                        const tc_pixel_t *pred, int blk_size);
+
+/* ── Inter prediction / motion estimation ────────────────────── */
+
+/* Compute SAD between two n×n blocks. */
+tc_sad_t tc_sad(const tc_pixel_t *a, int stride_a,
+                const tc_pixel_t *b, int stride_b, int n);
+
+/* Sub-pixel SAD (bilinear interpolation at quarter-pel). */
+tc_sad_t tc_sad_subpel(const tc_pixel_t *ref, int ref_stride,
+                       int mv_x_qpel, int mv_y_qpel,
+                       const tc_pixel_t *orig, int orig_stride, int n);
+
+/* Hierarchical hexagonal motion estimation.
+ * ref_w, ref_h: reference frame dimensions for bounds checking.
+ * center_x, center_y: search center (collocated position or median predictor).
+ * search_range: max pixel displacement.
+ * Returns best MV in quarter-pel and best SAD. */
+tc_mv_s tc_motion_est(const tc_pixel_t *ref, int ref_stride,
+                      int ref_w, int ref_h,
+                      const tc_pixel_t *orig, int orig_stride,
+                      int center_x, int center_y,
+                      int blk_size, int search_range,
+                      tc_sad_t *best_sad_out);
+
+/* Inter predict: copy from reference at sub-pel position.
+ * Uses 6-tap luma filter with bilinear fallback at frame edges.
+ * ref_w, ref_h: reference frame dimensions for bounds-safe filtering. */
+void tc_inter_predict(const tc_pixel_t *ref, int ref_stride,
+                      int ref_w, int ref_h,
+                      tc_mv_s mv,
+                      tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
+                      int blk_size);
+
+/* ── Deblocking filter ───────────────────────────────────────── */
+
+/* Filter one CTU's edges. Strength based on QP and boundary strength. */
+void tc_deblock_ctu(tc_pixel_t *y,  int stride_y,
+                    tc_pixel_t *cb, int stride_cb,
+                    tc_pixel_t *cr, int stride_cr,
+                    int ctu_x, int ctu_y, int qp);
+
+/* ── Rate control ────────────────────────────────────────────── */
+
+typedef struct tc_ratectl {
+    tc_ratectrl_t method;
+    int32_t       target_bitrate;     /* bps */
+    double        rho;                /* Zero-fraction (ρ-domain) */
+    double        rho_per_qp[64];     /* ρ(QP) lookup table */
+    int32_t       qp;                 /* Current QP */
+    int64_t       frame_bits_target;  /* Target bits per frame */
+    int64_t       frame_bits_actual;  /* Actual bits for last frame */
+    int64_t       total_bits;         /* Running total */
+    int32_t       total_frames;
+    double        buffer_level;       /* VBV buffer fullness (0..1) */
+    double        buffer_size;        /* VBV buffer size in bits */
+    int32_t       fps_num;
+    int32_t       fps_den;
+} tc_ratectl_t;
+
+void tc_ratectl_init(tc_ratectl_t *rc, const tc_config_t *cfg);
+void tc_ratectl_frame_start(tc_ratectl_t *rc, tc_frame_type_t type);
+int  tc_ratectl_get_qp(tc_ratectl_t *rc);
+void tc_ratectl_frame_end(tc_ratectl_t *rc, int64_t bits_used);
+
+/* ── Encoder internals ───────────────────────────────────────── */
+
+typedef struct tc_encoder {
+    tc_config_t       cfg;
+    tc_frame_buf_t   *cur;             /* Current input frame */
+    tc_frame_buf_t   *recon;           /* Reconstructed frame */
+    tc_ref_entry_t    dpb[TC_REF_FRAMES]; /* Decoded picture buffer */
+    tc_ratectl_t      rc;
+    tc_tans_enc_t     tans;
+    tc_bs_writer_t    bs;
+    tc_ctu_info_t    *ctu_data;        /* Per-CTU coding info array */
+    int              *ctu_row_start;   /* Bitstream offset per CTU row */
+    int32_t           num_ctu_cols;
+    int32_t           num_ctu_rows;
+    int32_t           frame_count;
+    int32_t           force_keyframe;
+    /* Thread pool for WPP (only when threading enabled) */
+#if !defined(TCODEC_NO_THREADS)
+    pthread_t        *threads;
+    int               num_threads;
+    pthread_mutex_t   row_mutex;
+    pthread_cond_t    row_cond;
+    int              *row_done;        /* Per-row completion flag */
+#endif
+    /* Stats */
+    int64_t           total_bytes;
+    int32_t           total_frames;
+    double            sum_psnr;
+    /* Bitstream output buffer */
+    uint8_t          *out_buf;
+    size_t            out_buf_size;
+} tc_encoder_t;
+
+/* ── Decoder internals ───────────────────────────────────────── */
+
+typedef struct tc_decoder {
+    int32_t           width;
+    int32_t           height;
+    tc_frame_buf_t   *cur;             /* Current reconstructed frame */
+    tc_ref_entry_t    dpb[TC_REF_FRAMES];
+    tc_tans_dec_t     tans;
+    tc_bs_reader_t    bs;
+    tc_ctu_info_t    *ctu_data;
+    int32_t           num_ctu_cols;
+    int32_t           num_ctu_rows;
+    int32_t           prev_qp;
+    /* Thread pool for WPP (only when threading enabled) */
+#if !defined(TCODEC_NO_THREADS)
+    pthread_t        *threads;
+    int               num_threads;
+    pthread_mutex_t   row_mutex;
+    pthread_cond_t    row_cond;
+    int              *row_done;
+#endif
+    /* Output packet info */
+    tc_frame_header_t last_header;
+} tc_decoder_t;
+
+/* ── PSNR computation ────────────────────────────────────────── */
+
+double tc_psnr(const tc_pixel_t *a, int stride_a,
+               const tc_pixel_t *b, int stride_b,
+               int width, int height);
+
+/* ── Thread pool for WPP ─────────────────────────────────────── */
+
+#if !defined(TCODEC_NO_THREADS)
+
+typedef void (*tc_wpp_row_func)(void *ctx, int row);
+
+typedef struct tc_threadpool {
+    pthread_t       *threads;
+    int              num_threads;
+    tc_wpp_row_func  func;
+    void            *ctx;
+    int              next_row;
+    int              total_rows;
+    int             *row_done;
+    pthread_mutex_t  mutex;
+    pthread_cond_t   work_cond;
+    pthread_cond_t   done_cond;
+    int              shutdown;
+} tc_threadpool_t;
+
+tc_threadpool_t *tc_threadpool_create(int num_threads);
+void             tc_threadpool_destroy(tc_threadpool_t *pool);
+void             tc_threadpool_run(tc_threadpool_t *pool,
+                                    tc_wpp_row_func func, void *ctx,
+                                    int total_rows);
+
+#endif /* TCODEC_NO_THREADS */
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TCODEC_COMMON_H */

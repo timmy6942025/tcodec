@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+*.o
+*.a
+
+# Compiled binaries
+tcenc
+tcdec
+test_tcodec
+
+# OS files
+.DS_Store
+*.dSYM
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

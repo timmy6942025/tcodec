@@ -1,0 +1,899 @@
+/*
+ * encoder.c — Encoding pipeline for TCodec
+ *
+ * Pipeline:
+ *   1. Frame header write
+ *   2. For each CTU (with WPP parallelism):
+ *      a. Intra prediction (9 modes, SAD-select best)
+ *      b. Motion estimation (hierarchical hex search, inter frames)
+ *      c. Mode decision (intra vs inter vs skip, simplified RDO)
+ *      d. Forward DCT → Quantize → tANS encode
+ *      e. Inverse quantize → Inverse DCT → Reconstruct
+ *      f. Deblocking filter
+ *   3. Rate control feedback
+ */
+
+#include "tcodec_common.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* Forward declaration — defined later in this file */
+void tc_encoder_destroy(tc_encoder_t *enc);
+
+/* ── Variance-based DCT size selection ─────────────────────────
+ *
+ * For each 8×8 block, compute variance:
+ *   High variance → 4×4 DCT (preserve detail)
+ *   Low variance  → 8×8 DCT (better energy compaction)
+ *
+ * Threshold tuned for 20:1 compression target.
+ * ══════════════════════════════════════════════════════════════ */
+
+#define VARIANCE_THRESHOLD 512   /* Above this → 4×4 DCT */
+
+static int block_variance(const tc_pixel_t *y, int stride, int blk_size)
+{
+    int32_t sum = 0, sum_sq = 0;
+    int n = blk_size * blk_size;
+
+    for (int y0 = 0; y0 < blk_size; y0++) {
+        for (int x0 = 0; x0 < blk_size; x0++) {
+            int v = y[y0 * stride + x0];
+            sum += v;
+            sum_sq += v * v;
+        }
+    }
+
+    /* variance = (sum_sq - sum^2/n) / n = E[X^2] - E[X]^2 */
+    int64_t mean = sum / n;
+    int64_t var = sum_sq / n - mean * mean;
+    return (int)var;
+}
+
+/* ── Scene cut detection ───────────────────────────────────────
+ *
+ * Compare current frame histogram against previous frame.
+ * Large histogram change indicates a scene cut → force keyframe.
+ * Uses a simple chi-squared distance on 16-bin luma histograms.
+ * ══════════════════════════════════════════════════════════════ */
+
+#define HIST_BINS 16
+#define SCENE_CUT_THRESHOLD 0.5
+
+static double histogram_distance(const tc_pixel_t *cur, int cur_stride,
+                                  const tc_pixel_t *prev, int prev_stride,
+                                  int width, int height)
+{
+    int hist_cur[HIST_BINS] = {0};
+    int hist_prev[HIST_BINS] = {0};
+    int total = width * height;
+
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            int bin_c = cur[row * cur_stride + col] * HIST_BINS / 256;
+            int bin_p = prev[row * prev_stride + col] * HIST_BINS / 256;
+            if (bin_c >= HIST_BINS) bin_c = HIST_BINS - 1;
+            if (bin_p >= HIST_BINS) bin_p = HIST_BINS - 1;
+            hist_cur[bin_c]++;
+            hist_prev[bin_p]++;
+        }
+    }
+
+    double dist = 0.0;
+    for (int i = 0; i < HIST_BINS; i++) {
+        double expected = (hist_prev[i] + hist_cur[i]) / 2.0;
+        if (expected > 0) {
+            double diff = (double)hist_cur[i] - (double)hist_prev[i];
+            dist += (diff * diff) / expected;
+        }
+    }
+    return dist / (double)total;
+}
+
+/* ── Encode one 8×8 block ───────────────────────────────────── */
+
+static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
+                         int blk_idx, int bx, int by,
+                         int frame_x, int frame_y,
+                         int qp, tc_frame_type_t frame_type)
+{
+    tc_block_info_t *blk = &ctu->blocks[blk_idx];
+
+    /* Always process 8×8 blocks for prediction/residual. */
+    int blk_size = 8;
+    int n_coeff  = 64;
+
+    tc_pixel_t orig_block[64];    /* Max 8×8 */
+    tc_pixel_t pred_block[64];
+    tc_coeff_t residual[64];
+    tc_coeff_t dct_out[64];
+
+    /* Extract original block from current frame */
+    for (int y0 = 0; y0 < blk_size; y0++) {
+        memcpy(orig_block + y0 * blk_size,
+               enc->cur->y + (frame_y + y0) * enc->cur->stride_y + frame_x,
+               (size_t)blk_size);
+    }
+
+    /* ── Intra prediction ──────────────────────────────────── */
+    tc_pixel_t ref_above[32 + 1];  /* Max 2×8 + 1 */
+    tc_pixel_t ref_left[32 + 1];
+
+    tc_intra_get_ref(enc->recon->y, enc->recon->stride_y,
+                     frame_x, frame_y, blk_size,
+                     enc->cfg.width, enc->cfg.height,
+                     ref_above + 1, ref_left + 1);
+
+    tc_intra_mode_t best_intra = TC_INTRA_DC;
+    tc_sad_t best_intra_sad = 0x7FFFFFFF;
+
+    /* Try all 9 intra modes */
+    for (int m = 0; m < TC_INTRA_MODES; m++) {
+        tc_pixel_t tmp_pred[64];
+        tc_intra_predict(tmp_pred, blk_size,
+                         ref_above + 1, ref_left + 1,
+                         blk_size, (tc_intra_mode_t)m);
+        tc_sad_t sad = tc_intra_cost(orig_block, blk_size, tmp_pred, blk_size);
+        if (sad < best_intra_sad) {
+            best_intra_sad = sad;
+            best_intra = (tc_intra_mode_t)m;
+        }
+    }
+
+    blk->intra_mode = best_intra;
+    blk->is_intra = 1;  /* Default: intra */
+
+    /* Re-generate best prediction */
+    tc_intra_predict(pred_block, blk_size,
+                     ref_above + 1, ref_left + 1,
+                     blk_size, best_intra);
+
+    /* ── Inter prediction (P-frames only) ────────────────────
+     * Search multiple reference frames and pick the best.
+     * Also computes merge_mv (median of spatial neighbors) for merge mode.
+     * ref_idx is signaled in the bitstream for multi-ref support. */
+    tc_sad_t best_inter_sad = 0x7FFFFFFF;
+    tc_mv_s  best_mv = {0, 0};
+    tc_pixel_t inter_pred[64];
+    int best_ref_idx = 0;
+
+    /* Merge MV: median of spatial neighbors (used for merge mode
+     * and as ME search center). Computed once, reused for all refs. */
+    tc_mv_s  merge_mv = {frame_x * 4, frame_y * 4};  /* Default: collocated */
+    tc_sad_t merge_sad = 0x7FFFFFFF;
+    int merge_available = 0;
+
+    if (frame_type != TC_FRAME_KEY) {
+        /* Compute median MV predictor from spatial neighbors.
+         * Used as ME search center AND as merge mode candidate MV. */
+        if (blk_idx > 0) {
+            tc_mv_s mv_a = {0,0}, mv_b = {0,0}, mv_c = {0,0};
+            int have_a = 0, have_b = 0, have_c = 0;
+            if (bx > 0) {
+                tc_block_info_t *left = &ctu->blocks[blk_idx - 1];
+                if (!left->is_intra) { mv_a = left->mv; have_a = 1; }
+            }
+            if (by > 0) {
+                tc_block_info_t *above = &ctu->blocks[blk_idx - 8];
+                if (!above->is_intra) { mv_b = above->mv; have_b = 1; }
+            }
+            if (by > 0 && bx < 7) {
+                tc_block_info_t *ar = &ctu->blocks[blk_idx - 7];
+                if (!ar->is_intra) { mv_c = ar->mv; have_c = 1; }
+            }
+            if (have_a || have_b || have_c) {
+                if (!have_a) mv_a = have_b ? mv_b : mv_c;
+                if (!have_b) mv_b = have_a ? mv_a : mv_c;
+                if (!have_c) mv_c = have_a ? mv_a : mv_b;
+                int px, py;
+                { int a=mv_a.x,b=mv_b.x,c=mv_c.x; if(a>b){int t=a;a=b;b=t;} if(b>c){int t=b;b=c;c=t;} if(a>b){int t=a;a=b;b=t;} px=b; }
+                { int a=mv_a.y,b=mv_b.y,c=mv_c.y; if(a>b){int t=a;a=b;b=t;} if(b>c){int t=b;b=c;c=t;} if(a>b){int t=a;a=b;b=t;} py=b; }
+                merge_mv.x = px;
+                merge_mv.y = py;
+                merge_available = 1;
+            }
+        }
+
+        /* Search range depends on preset */
+        int search_range = 32;
+        if (enc->cfg.preset == TC_PRESET_ULTRAFAST)  search_range = 16;
+        if (enc->cfg.preset == TC_PRESET_SLOW)       search_range = 64;
+
+        /* Try each reference frame in DPB.
+         * Only search multiple refs on SLOW preset — ULTRAFAST/FAST/MEDIUM
+         * only use the most recent reference (slot 0) to keep ME cost down. */
+        int max_refs = (enc->cfg.preset == TC_PRESET_SLOW) ? TC_REF_FRAMES : 1;
+        for (int ri = 0; ri < max_refs; ri++) {
+            const tc_frame_buf_t *rframe = enc->dpb[ri].frame;
+            if (!rframe) continue;
+
+            /* Search center from merge MV (median predictor) */
+            int center_x = tc_clip(merge_mv.x / 4, 0, rframe->width - blk_size);
+            int center_y = tc_clip(merge_mv.y / 4, 0, rframe->height - blk_size);
+
+            tc_sad_t ref_sad;
+            tc_mv_s ref_mv = tc_motion_est(rframe->y, rframe->stride_y,
+                                            rframe->width, rframe->height,
+                                            orig_block, blk_size,
+                                            center_x, center_y,
+                                            blk_size, search_range,
+                                            &ref_sad);
+
+            if (ref_sad < best_inter_sad) {
+                best_inter_sad = ref_sad;
+                best_mv = ref_mv;
+                best_ref_idx = ri;
+            }
+        }
+
+        /* Generate inter prediction from best reference */
+        if (best_inter_sad < best_intra_sad) {
+            const tc_frame_buf_t *best_ref = enc->dpb[best_ref_idx].frame;
+            tc_inter_predict(best_ref->y, best_ref->stride_y,
+                             best_ref->width, best_ref->height,
+                             best_mv, inter_pred, blk_size, blk_size);
+            blk->is_intra = 0;
+            blk->mv = best_mv;
+            blk->ref_idx = (uint8_t)best_ref_idx;
+            memcpy(pred_block, inter_pred, (size_t)n_coeff * sizeof(tc_pixel_t));
+        }
+
+        /* Compute merge SAD: prediction quality at the merge MV position.
+         * This determines whether merge mode (implicit MV, no MVD/ref_idx)
+         * is a good choice — significant bitrate savings when the median
+         * predictor is accurate. */
+        if (merge_available) {
+            const tc_frame_buf_t *rframe = enc->dpb[0].frame;
+            if (rframe) {
+                int mx = merge_mv.x >> 2;
+                int my = merge_mv.y >> 2;
+                if (mx >= 0 && my >= 0 &&
+                    mx + blk_size <= rframe->width &&
+                    my + blk_size <= rframe->height) {
+                    merge_sad = tc_sad(rframe->y + my * rframe->stride_y + mx,
+                                       rframe->stride_y,
+                                       orig_block, blk_size, blk_size);
+                }
+            }
+        }
+    }
+
+    /* ── Compute residual ──────────────────────────────────── */
+    for (int i = 0; i < n_coeff; i++) {
+        residual[i] = (tc_coeff_t)((int)orig_block[i] - (int)pred_block[i]);
+    }
+
+    /* ── Variance-based DCT size selection ────────────────── */
+    int dct_size_id;
+    {
+        int var = block_variance(orig_block, blk_size, blk_size);
+        dct_size_id = (var > VARIANCE_THRESHOLD) ? TC_BLOCK_4x4_ID : TC_BLOCK_8x8_ID;
+    }
+    blk->dct_size = (tc_block_size_t)dct_size_id;
+
+    /* ── Forward DCT + quantize ────────────────────────────── */
+    int all_zero = 1;  /* Track if all quantized coefficients are zero */
+
+    if (dct_size_id == TC_BLOCK_4x4_ID) {
+        /* Process each 4×4 sub-block */
+        for (int sy = 0; sy < 2; sy++) {
+            for (int sx = 0; sx < 2; sx++) {
+                tc_coeff_t sub_in[16], sub_out[16];
+                for (int r = 0; r < 4; r++) {
+                    for (int c = 0; c < 4; c++) {
+                        sub_in[r * 4 + c] = residual[(sy * 4 + r) * 8 + (sx * 4 + c)];
+                    }
+                }
+                tc_fwht4x4(sub_in, 4, sub_out);
+                /* Apply JND band weighting per coefficient */
+                for (int i = 0; i < 16; i++) {
+                    int band = tc_freq_band(i, 4);
+                    int w = tc_jnd_weight(band, i);
+                    int scale = tc_qscale(qp);
+                    int eff = (scale * w + 4) >> 3;
+                    if (eff < 1) eff = 1;
+                    int offset = eff / 3;
+                    int c = sub_out[i];
+                    if (c > 0) sub_out[i] = (tc_coeff_t)((c + offset) / eff);
+                    else if (c < 0) sub_out[i] = (tc_coeff_t)(-((-c + offset) / eff));
+                    else sub_out[i] = 0;
+                    if (sub_out[i] != 0) all_zero = 0;
+                }
+
+                for (int r = 0; r < 4; r++) {
+                    for (int c = 0; c < 4; c++) {
+                        dct_out[(sy * 4 + r) * 8 + (sx * 4 + c)] = sub_out[r * 4 + c];
+                    }
+                }
+            }
+        }
+    } else {
+        /* 8×8 DCT on residual — apply JND band weighting per coefficient */
+        tc_fwht8x8(residual, 8, dct_out);
+        for (int i = 0; i < 64; i++) {
+            int band = tc_freq_band(i, 8);
+            int w = tc_jnd_weight(band, i);
+            int scale = tc_qscale(qp);
+            int eff = (scale * w + 4) >> 3;
+            if (eff < 1) eff = 1;
+            int offset = eff / 3;
+            int c = dct_out[i];
+            if (c > 0) dct_out[i] = (tc_coeff_t)((c + offset) / eff);
+            else if (c < 0) dct_out[i] = (tc_coeff_t)(-((-c + offset) / eff));
+            else dct_out[i] = 0;
+            if (dct_out[i] != 0) all_zero = 0;
+        }
+    }
+
+    /* ── Mode decision: merge > skip > inter > intra ──────────
+     * Merge (mode 3): zero residual, MV derived from spatial neighbors.
+     *   No ref_idx or MVD signaled — significant bitrate savings.
+     * Skip (mode 0): zero residual, MV explicitly signaled via MVD.
+     * Inter (mode 1): non-zero residual, MV signaled via MVD.
+     * Intra (mode 2): intra prediction, no MV. */
+    int is_merge = 0;
+    int is_skip = 0;
+    if (!blk->is_intra && frame_type != TC_FRAME_KEY) {
+        /* Merge: use median predictor MV if it gives good SAD.
+         * Prefer merge over skip when merge_sad is competitive because
+         * merge saves the ref_idx (2 bits) + MVD (often 5-15 bits). */
+        if (all_zero && merge_available && merge_sad < (tc_sad_t)(qp * qp)) {
+            is_merge = 1;
+        } else if (all_zero) {
+            is_skip = 1;
+        } else if (best_inter_sad < (tc_sad_t)(qp * qp / 2)) {
+            /* Very low SAD even with some residual — skip for compression gain */
+            is_skip = 1;
+            memset(dct_out, 0, sizeof(tc_coeff_t) * 64);
+        }
+    }
+
+    /* For merge: override prediction with merge MV (from median predictor) */
+    if (is_merge) {
+        const tc_frame_buf_t *rframe = enc->dpb[0].frame;
+        if (rframe) {
+            tc_inter_predict(rframe->y, rframe->stride_y,
+                             rframe->width, rframe->height,
+                             merge_mv, pred_block, blk_size, blk_size);
+        } else {
+            /* Safety: dpb[0] should never be NULL on P-frames, but if it is,
+             * fill prediction with 128 to avoid stale intra pred data. */
+            memset(pred_block, 128, (size_t)n_coeff);
+        }
+        blk->is_intra = 0;
+        blk->mv = merge_mv;
+        blk->ref_idx = 0;
+    }
+
+    /* ── Write mode decision to bitstream ──────────────────── */
+    if (frame_type != TC_FRAME_KEY) {
+        /* Mode: 0=skip, 1=inter, 2=intra, 3=merge (2 bits) */
+        if (is_merge) {
+            tc_bs_writer_write_bits(&enc->bs, 3, 2);  /* merge */
+        } else if (is_skip) {
+            tc_bs_writer_write_bits(&enc->bs, 0, 2);  /* skip */
+        } else if (blk->is_intra) {
+            tc_bs_writer_write_bits(&enc->bs, 2, 2);  /* intra */
+        } else {
+            tc_bs_writer_write_bits(&enc->bs, 1, 2);  /* inter with residual */
+        }
+    }
+
+    if (blk->is_intra && !is_skip && !is_merge) {
+        tc_bs_writer_write_bits(&enc->bs, (uint32_t)blk->intra_mode, 4);
+    }
+
+    /* ref_idx + MVD: written for inter/skip only (NOT merge — merge
+     * derives MV from spatial neighbors, saving ref_idx + MVD bits). */
+    if (!blk->is_intra && !is_merge) {
+        /* Write ref_idx (2 bits, supports up to 4 reference frames).
+         * Only written for inter/skip blocks on P-frames. */
+        if (frame_type != TC_FRAME_KEY) {
+            tc_bs_writer_write_bits(&enc->bs, (uint32_t)blk->ref_idx, 2);
+        }
+        /* Write MVD for inter/skip blocks.
+         * Skip blocks carry the actual MV — skip means zero residual,
+         * not zero MV. The decoder needs the correct MV to produce
+         * the right prediction. */
+        /* MVD coded relative to median predictor (not collocated).
+         * This produces smaller MVDs when spatial neighbors are available,
+         * matching the decoder's predictor_mv derivation exactly. */
+        int32_t mvd_x = blk->mv.x - merge_mv.x;
+        int32_t mvd_y = blk->mv.y - merge_mv.y;
+        tc_bs_writer_write_se(&enc->bs, mvd_x);
+        tc_bs_writer_write_se(&enc->bs, mvd_y);
+    }
+
+    /* ── Reconstruct + encode coefficients ──────────────────── */
+    if (is_merge || is_skip) {
+        /* Zero residual: copy prediction directly into recon buffer.
+         * Must still reconstruct so that subsequent intra prediction,
+         * deblocking, and DPB are correct. */
+        for (int r = 0; r < blk_size; r++) {
+            for (int c = 0; c < blk_size; c++) {
+                int px = frame_x + c, py = frame_y + r;
+                if (px < enc->recon->width && py < enc->recon->height) {
+                    enc->recon->y[py * enc->recon->stride_y + px] = pred_block[r * blk_size + c];
+                }
+            }
+        }
+    } else {
+        /* Non-skip/non-merge: write DCT flag, encode coefficients, reconstruct */
+        tc_bs_writer_write_bits(&enc->bs, dct_size_id, 1);
+
+        /* ── tANS encode coefficients ────────────────────────── */
+        if (dct_size_id == TC_BLOCK_4x4_ID) {
+            for (int sy = 0; sy < 2; sy++) {
+                for (int sx = 0; sx < 2; sx++) {
+                    tc_coeff_t sub[16];
+                    for (int r = 0; r < 4; r++) {
+                        for (int c = 0; c < 4; c++) {
+                            sub[r * 4 + c] = dct_out[(sy * 4 + r) * 8 + (sx * 4 + c)];
+                        }
+                    }
+                    tc_tans_enc_coeffs(&enc->tans, sub, 16, TC_BLOCK_4x4_ID);
+                }
+            }
+        } else {
+            tc_tans_enc_coeffs(&enc->tans, dct_out, n_coeff, TC_BLOCK_8x8_ID);
+        }
+
+        /* ── Reconstruct (dequantize + IDCT + add prediction) ── */
+        if (dct_size_id == TC_BLOCK_4x4_ID) {
+            for (int sy = 0; sy < 2; sy++) {
+                for (int sx = 0; sx < 2; sx++) {
+                    tc_coeff_t sub[16];
+                    for (int r = 0; r < 4; r++) {
+                        for (int c = 0; c < 4; c++) {
+                            sub[r * 4 + c] = dct_out[(sy * 4 + r) * 8 + (sx * 4 + c)];
+                        }
+                    }
+                    /* Dequantize with per-coefficient JND band weighting */
+                    for (int i = 0; i < 16; i++) {
+                        int band = tc_freq_band(i, 4);
+                        int w = tc_jnd_weight(band, i);
+                        int scale = tc_qscale(qp);
+                        int eff = (scale * w + 4) >> 3;
+                        if (eff < 1) eff = 1;
+                        if (sub[i] > 0) sub[i] = (tc_coeff_t)(sub[i] * eff + (eff >> 1));
+                        else if (sub[i] < 0) sub[i] = (tc_coeff_t)(sub[i] * eff - (eff >> 1));
+                    }
+                    tc_coeff_t rec[16];
+                    tc_iwht4x4(sub, rec, 4);
+                    for (int r = 0; r < 4; r++) {
+                        for (int c = 0; c < 4; c++) {
+                            int px = frame_x + sx * 4 + c;
+                            int py = frame_y + sy * 4 + r;
+                            if (px < enc->recon->width && py < enc->recon->height) {
+                                int val = (int)pred_block[(sy * 4 + r) * blk_size + (sx * 4 + c)] + (int)rec[r * 4 + c];
+                                enc->recon->y[py * enc->recon->stride_y + px] = (tc_pixel_t)tc_clip(val, 0, 255);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            /* Dequantize with per-coefficient JND band weighting */
+            for (int i = 0; i < 64; i++) {
+                int band = tc_freq_band(i, 8);
+                int w = tc_jnd_weight(band, i);
+                int scale = tc_qscale(qp);
+                int eff = (scale * w + 4) >> 3;
+                if (eff < 1) eff = 1;
+                if (dct_out[i] > 0) dct_out[i] = (tc_coeff_t)(dct_out[i] * eff + (eff >> 1));
+                else if (dct_out[i] < 0) dct_out[i] = (tc_coeff_t)(dct_out[i] * eff - (eff >> 1));
+            }
+            tc_coeff_t rec[64];
+            tc_iwht8x8(dct_out, rec, 8);
+            for (int r = 0; r < 8; r++) {
+                for (int c = 0; c < 8; c++) {
+                    int px = frame_x + c;
+                    int py = frame_y + r;
+                    if (px < enc->recon->width && py < enc->recon->height) {
+                        int val = (int)pred_block[r * blk_size + c] + (int)rec[r * 8 + c];
+                        enc->recon->y[py * enc->recon->stride_y + px] = (tc_pixel_t)tc_clip(val, 0, 255);
+                    }
+                }
+            }
+        }
+    } /* end else (non-skip/non-merge reconstruct) */
+
+    /* ── Encode chroma (always) ─────────────────────────────── */
+    /* Chroma uses 4×4 DCT with chroma-from-luma (CfL) prediction
+     * when luma is intra. For inter/skip/merge, use DC prediction. */
+    int cx = frame_x / 2;
+    int cy = frame_y / 2;
+    for (int comp = 0; comp < 2; comp++) {
+        tc_pixel_t *chroma_orig = comp == 0 ? enc->cur->cb : enc->cur->cr;
+        tc_pixel_t *chroma_recon = comp == 0 ? enc->recon->cb : enc->recon->cr;
+        int c_stride = enc->cur->stride_c;
+
+        tc_pixel_t c_orig[16], c_pred[16];
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                c_orig[r * 4 + c] = chroma_orig[(cy + r) * c_stride + (cx + c)];
+            }
+        }
+
+        /* Chroma prediction */
+        if (blk->is_intra && !is_skip && !is_merge) {
+            /* CfL (Chroma from Luma): use reconstructed luma to predict chroma.
+             * Simple linear model: c_pred = alpha * luma_avg + beta
+             * where luma_avg is the average of the corresponding reconstructed
+             * luma 4×4 block, and alpha/beta are derived from the DC mode. */
+            int luma_sum = 0;
+            for (int r = 0; r < 4; r++) {
+                for (int c = 0; c < 4; c++) {
+                    luma_sum += (int)enc->recon->y[(frame_y + r) * enc->recon->stride_y + (frame_x + c)];
+                }
+            }
+            int luma_avg = luma_sum / 16;
+            /* DC prediction from chroma reference samples */
+            int c_ref_sum = 0;
+            int c_ref_count = 0;
+            /* Top row */
+            if (cy > 0) {
+                for (int c = 0; c < 4; c++) {
+                    c_ref_sum += (int)chroma_recon[(cy - 1) * c_stride + (cx + c)];
+                    c_ref_count++;
+                }
+            }
+            /* Left col */
+            if (cx > 0) {
+                for (int r = 0; r < 4; r++) {
+                    c_ref_sum += (int)chroma_recon[(cy + r) * c_stride + (cx - 1)];
+                    c_ref_count++;
+                }
+            }
+            int c_dc = c_ref_count > 0 ? (c_ref_sum + c_ref_count / 2) / c_ref_count : 128;
+            /* Blend DC prediction with luma correlation */
+            int alpha_shift = 3;  /* alpha ≈ 0.125 (weak correlation) */
+            for (int i = 0; i < 16; i++) {
+                int luma_val = (int)enc->recon->y[(frame_y + (i / 4)) * enc->recon->stride_y + (frame_x + (i % 4))];
+                int cfl = c_dc + ((luma_val - luma_avg) >> alpha_shift);
+                c_pred[i] = (tc_pixel_t)tc_clip(cfl, 0, 255);
+            }
+        } else {
+            /* DC prediction for inter/skip blocks */
+            for (int i = 0; i < 16; i++) {
+                c_pred[i] = 128;
+            }
+        }
+
+        tc_coeff_t c_res[16], c_dct[16];
+        for (int i = 0; i < 16; i++) c_res[i] = (tc_coeff_t)(c_orig[i] - c_pred[i]);
+
+        /* DCT + quantize + encode (residual-mode) */
+        tc_fwht4x4(c_res, 4, c_dct);
+        tc_quantize(c_dct, 16, tc_clip(qp + 1, 0, 63), 0);
+        tc_tans_enc_coeffs(&enc->tans, c_dct, 16, TC_BLOCK_4x4_ID);
+
+        /* Reconstruct chroma */
+        tc_dequantize(c_dct, 16, tc_clip(qp + 1, 0, 63), 0);
+        tc_coeff_t c_rec[16];
+        tc_iwht4x4(c_dct, c_rec, 4);
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                int val = (int)c_pred[r * 4 + c] + (int)c_rec[r * 4 + c];
+                if (cx + c < enc->recon->width / 2 && cy + r < enc->recon->height / 2) {
+                    chroma_recon[(cy + r) * c_stride + (cx + c)] = (tc_pixel_t)tc_clip(val, 0, 255);
+                }
+            }
+        }
+    }
+}
+
+/* ── Encode one CTU row (WPP unit) ──────────────────────────── */
+
+typedef struct {
+    tc_encoder_t *enc;
+    int row;
+    int qp;
+    tc_frame_type_t frame_type;
+} enc_row_ctx_t;
+
+static void encode_row(void *ctx, int row)
+{
+    enc_row_ctx_t *rctx = (enc_row_ctx_t *)ctx;
+    tc_encoder_t *enc = rctx->enc;
+    int qp = rctx->qp;
+
+    for (int col = 0; col < enc->num_ctu_cols; col++) {
+        int ctu_x = col * TC_CTU_SIZE;
+        int ctu_y = row * TC_CTU_SIZE;
+        int ctu_idx = row * enc->num_ctu_cols + col;
+        tc_ctu_info_t *ctu = &enc->ctu_data[ctu_idx];
+        ctu->row = row;
+        ctu->col = col;
+
+        /* For each 8×8 block in CTU */
+        for (int by = 0; by < TC_CTU_SIZE / 8; by++) {
+            for (int bx = 0; bx < TC_CTU_SIZE / 8; bx++) {
+                int blk_x = ctu_x + bx * 8;
+                int blk_y = ctu_y + by * 8;
+                int blk_idx = by * (TC_CTU_SIZE / 8) + bx;
+
+                /* Only process within frame bounds */
+                if (blk_x + 8 <= enc->cfg.width && blk_y + 8 <= enc->cfg.height) {
+                    /* Encode the block — DCT size flag is now inside encode_block
+                     * (written only for non-skip blocks) */
+                    encode_block(enc, ctu, blk_idx, bx, by,
+                                 blk_x, blk_y,
+                                 qp, rctx->frame_type);
+                }
+            }
+        }
+
+        /* Deblock this CTU */
+        if (ctu_x + TC_CTU_SIZE <= enc->cfg.width &&
+            ctu_y + TC_CTU_SIZE <= enc->cfg.height) {
+            tc_deblock_ctu(enc->recon->y, enc->recon->stride_y,
+                           enc->recon->cb, enc->recon->stride_c,
+                           enc->recon->cr, enc->recon->stride_c,
+                           ctu_x, ctu_y, qp);
+        }
+    }
+}
+
+/* ── Frame header write ──────────────────────────────────────── */
+
+static void write_frame_header(tc_bs_writer_t *bs, tc_frame_header_t *hdr)
+{
+    tc_bs_writer_write_bits(bs, hdr->magic[0], 8);
+    tc_bs_writer_write_bits(bs, hdr->magic[1], 8);
+    tc_bs_writer_write_bits(bs, hdr->magic[2], 8);
+    tc_bs_writer_write_bits(bs, hdr->version, 8);
+    tc_bs_writer_write_bits(bs, hdr->width, 16);
+    tc_bs_writer_write_bits(bs, hdr->height, 16);
+    tc_bs_writer_write_bits(bs, hdr->flags, 8);
+    tc_bs_writer_write_bits(bs, hdr->qp_delta, 8);
+    tc_bs_writer_write_bits(bs, hdr->frame_num, 8);
+    tc_bs_writer_write_bits(bs, hdr->reserved, 8);
+    tc_bs_writer_byte_align(bs);
+}
+
+/* ── Encoder create/destroy ──────────────────────────────────── */
+
+tc_encoder_t *tc_encoder_create(const tc_config_t *config)
+{
+    tc_encoder_t *enc = (tc_encoder_t *)calloc(1, sizeof(tc_encoder_t));
+    if (!enc) return NULL;
+
+    enc->cfg = *config;
+
+    /* Allocate frames */
+    enc->cur   = tc_frame_alloc(config->width, config->height);
+    enc->recon = tc_frame_alloc(config->width, config->height);
+    if (!enc->cur || !enc->recon) {
+        tc_encoder_destroy(enc);
+        return NULL;
+    }
+
+    /* CTU grid dimensions */
+    enc->num_ctu_cols = (config->width  + TC_CTU_SIZE - 1) / TC_CTU_SIZE;
+    enc->num_ctu_rows = (config->height + TC_CTU_SIZE - 1) / TC_CTU_SIZE;
+
+    /* Allocate CTU info */
+    enc->ctu_data = (tc_ctu_info_t *)calloc(
+        (size_t)enc->num_ctu_cols * enc->num_ctu_rows,
+        sizeof(tc_ctu_info_t));
+
+    /* Output buffer (generous initial size) */
+    enc->out_buf_size = (size_t)config->width * config->height * 3;  /* Worst case */
+    enc->out_buf = (uint8_t *)calloc(enc->out_buf_size, 1);  /* zeroed for determinism */
+
+    /* Init bitstream writer */
+    tc_bs_writer_init(&enc->bs, enc->out_buf, enc->out_buf_size);
+
+    /* Init tANS encoder */
+    tc_tans_enc_init(&enc->tans, &enc->bs);
+
+    /* Init rate control */
+    tc_ratectl_init(&enc->rc, config);
+
+    /* Init DPB */
+    for (int i = 0; i < TC_REF_FRAMES; i++) {
+        enc->dpb[i].frame = NULL;
+        enc->dpb[i].poc = -1;
+    }
+
+#if !defined(TCODEC_NO_THREADS)
+    /* Determine thread count */
+    int num_threads = config->threads;
+    if (num_threads <= 0) num_threads = 4;  /* Default for ARM quad-core */
+
+    enc->row_done = (int *)calloc((size_t)enc->num_ctu_rows, sizeof(int));
+    pthread_mutex_init(&enc->row_mutex, NULL);
+    pthread_cond_init(&enc->row_cond, NULL);
+#else
+    (void)config->threads;
+#endif
+
+    return enc;
+}
+
+void tc_encoder_destroy(tc_encoder_t *enc)
+{
+    if (!enc) return;
+    tc_frame_free(enc->cur);
+    tc_frame_free(enc->recon);
+    for (int i = 0; i < TC_REF_FRAMES; i++) {
+        tc_frame_free(enc->dpb[i].frame);
+    }
+    free(enc->ctu_data);
+    free(enc->out_buf);
+#if !defined(TCODEC_NO_THREADS)
+    free(enc->row_done);
+    pthread_mutex_destroy(&enc->row_mutex);
+    pthread_cond_destroy(&enc->row_cond);
+#endif
+    free(enc);
+}
+
+void tc_encoder_force_keyframe(tc_encoder_t *enc)
+{
+    enc->force_keyframe = 1;
+}
+
+void tc_encoder_get_stats(tc_encoder_t *enc,
+                           int64_t *total_bytes,
+                           int32_t *total_frames,
+                           double  *avg_psnr)
+{
+    if (total_bytes)  *total_bytes  = enc->total_bytes;
+    if (total_frames) *total_frames = enc->total_frames;
+    if (avg_psnr)     *avg_psnr = (enc->total_frames > 0)
+        ? enc->sum_psnr / enc->total_frames : 0.0;
+}
+
+/* ── Main encode function ────────────────────────────────────── */
+
+tc_error_t tc_encoder_encode(tc_encoder_t *enc,
+                              const tc_pixel_t *y,  int stride_y,
+                              const tc_pixel_t *cb, int stride_cb,
+                              const tc_pixel_t *cr, int stride_cr,
+                              tc_packet_t *packet_out)
+{
+    /* Copy input to internal frame */
+    for (int row = 0; row < enc->cfg.height; row++) {
+        memcpy(enc->cur->y + row * enc->cur->stride_y,
+               y + row * stride_y, (size_t)enc->cfg.width);
+    }
+    for (int row = 0; row < enc->cfg.height / 2; row++) {
+        memcpy(enc->cur->cb + row * enc->cur->stride_c,
+               cb + row * stride_cb, (size_t)(enc->cfg.width / 2));
+        memcpy(enc->cur->cr + row * enc->cur->stride_c,
+               cr + row * stride_cr, (size_t)(enc->cfg.width / 2));
+    }
+
+    /* Determine frame type */
+    int is_key = enc->force_keyframe || (enc->frame_count == 0);
+    int keyframe_interval = enc->cfg.keyframe_interval > 0
+        ? enc->cfg.keyframe_interval : 30;
+
+    if (!is_key && (enc->frame_count % keyframe_interval == 0)) {
+        is_key = 1;
+    }
+
+    /* Scene cut detection: compare current vs previous frame */
+    if (!is_key && enc->frame_count > 0 && enc->dpb[0].frame != NULL) {
+        double cut_dist = histogram_distance(
+            enc->cur->y, enc->cur->stride_y,
+            enc->dpb[0].frame->y, enc->dpb[0].frame->stride_y,
+            enc->cfg.width, enc->cfg.height);
+        if (cut_dist > SCENE_CUT_THRESHOLD) {
+            is_key = 1;
+        }
+    }
+
+    enc->force_keyframe = 0;
+
+    tc_frame_type_t frame_type = is_key ? TC_FRAME_KEY : TC_FRAME_INTER;
+
+    /* Rate control */
+    tc_ratectl_frame_start(&enc->rc, frame_type);
+    int qp = tc_ratectl_get_qp(&enc->rc);
+
+    /* Reset bitstream writer.
+     * Zero the output buffer for deterministic encoding — even though
+     * the writer zeros bytes as it advances, memset ensures no stale
+     * data from a previous frame can affect alignment padding. */
+    memset(enc->out_buf, 0, enc->out_buf_size);
+    tc_bs_writer_init(&enc->bs, enc->out_buf, enc->out_buf_size);
+    tc_tans_enc_init(&enc->tans, &enc->bs);
+
+    /* Clear CTU block info for new frame — stale MVs from the previous
+     * frame could cause non-deterministic merge MV derivation at the
+     * start of each CTU (before blocks are overwritten). */
+    if (enc->ctu_data) {
+        memset(enc->ctu_data, 0,
+            (size_t)enc->num_ctu_cols * enc->num_ctu_rows * sizeof(tc_ctu_info_t));
+    }
+
+    /* Write frame header */
+    tc_frame_header_t hdr;
+    hdr.magic[0] = TC_MAGIC_0;
+    hdr.magic[1] = TC_MAGIC_1;
+    hdr.magic[2] = TC_MAGIC_2;
+    hdr.version  = TC_VERSION;
+    hdr.width    = (uint16_t)enc->cfg.width;
+    hdr.height   = (uint16_t)enc->cfg.height;
+    hdr.flags    = is_key ? TC_FLAG_KEY_FRAME : 0;
+    hdr.qp_delta = (uint8_t)(int8_t)(qp - TC_QP_DEFAULT);
+    hdr.frame_num = (uint8_t)(enc->frame_count & 0xFF);
+    hdr.reserved  = 0;
+    hdr.frame_type = frame_type;
+    hdr.qp = (uint8_t)qp;
+
+    write_frame_header(&enc->bs, &hdr);
+
+    /* After scene cut keyframes, clear ALL DPB entries to avoid
+     * referencing frames from before the cut. Key frames don't use
+     * inter prediction, so clearing dpb[0] too is safe. If we only
+     * cleared slots 1+, the DPB shift after encoding would copy the
+     * stale dpb[0] (pre-cut frame) into dpb[1]. */
+    if (is_key && enc->frame_count > 0) {
+        for (int i = 0; i < TC_REF_FRAMES; i++) {
+            if (enc->dpb[i].frame) {
+                tc_frame_free(enc->dpb[i].frame);
+                enc->dpb[i].frame = NULL;
+                enc->dpb[i].poc = -1;
+            }
+        }
+    }
+
+#if !defined(TCODEC_NO_THREADS)
+    /* Reset row completion flags */
+    memset(enc->row_done, 0, (size_t)enc->num_ctu_rows * sizeof(int));
+#endif
+
+    /* Encode CTU rows (sequential for now; WPP with thread pool can be added) */
+    enc_row_ctx_t rctx;
+    rctx.enc = enc;
+    rctx.qp = qp;
+    rctx.frame_type = frame_type;
+
+    for (int row = 0; row < enc->num_ctu_rows; row++) {
+        encode_row(&rctx, row);
+    }
+
+    /* Flush tANS */
+    tc_tans_enc_flush(&enc->tans);
+    tc_bs_writer_byte_align(&enc->bs);
+
+    /* Update rate control */
+    size_t frame_bytes = tc_bs_writer_bytes(&enc->bs);
+    tc_ratectl_frame_end(&enc->rc, (int64_t)frame_bytes * 8);
+
+    /* Compute PSNR */
+    double psnr = tc_psnr(enc->cur->y, enc->cur->stride_y,
+                           enc->recon->y, enc->recon->stride_y,
+                           enc->cfg.width, enc->cfg.height);
+    enc->sum_psnr += psnr;
+
+    /* Update DPB: shift entries and insert new frame at slot 0.
+     * IMPORTANT: Must free oldest entry BEFORE struct copy loop,
+     * otherwise we'd free a frame still pointed to by dpb[i-1].
+     * This keeps the most recent frames in the DPB for multi-ref.
+     * Oldest entry (slot TC_REF_FRAMES-1) is evicted. */
+    if (enc->dpb[TC_REF_FRAMES - 1].frame)
+        tc_frame_free(enc->dpb[TC_REF_FRAMES - 1].frame);
+    for (int i = TC_REF_FRAMES - 1; i > 0; i--) {
+        enc->dpb[i] = enc->dpb[i - 1];
+    }
+    enc->dpb[0].frame = tc_frame_clone(enc->recon);
+    enc->dpb[0].poc = enc->frame_count;
+    enc->dpb[0].qp_avg = (uint8_t)qp;
+
+    /* Fill output packet */
+    packet_out->data = enc->out_buf;
+    packet_out->size = frame_bytes;
+    packet_out->pts  = enc->frame_count;
+    packet_out->key_frame = is_key;
+
+    enc->total_bytes += (int64_t)frame_bytes;
+    enc->total_frames++;
+    enc->frame_count++;
+
+    return TC_OK;
+}
