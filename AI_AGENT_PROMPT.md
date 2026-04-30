@@ -23,6 +23,24 @@ Please read these files first to understand the project state:
 
 Then read the source files in src/ and neon/ to understand the implementation.
 
+## ⚠️ Phase Order Note — We're Doing Phases Out of Order
+
+The Master Plan's suggested execution order is:
+Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → ...
+
+We have skipped Phases 1 (Benchmark Harness) and 2 (Bitstream Redesign). We are
+doing phases in the following order instead (prioritizing compression wins first):
+Phase 0 → Phase 5 → Phase 3 → Phase 4 → Phase 6 → Phase 7 → Phase 8 → Phase 9 → Phase 10 → Phase 1 → Phase 2
+
+This is NOT the recommended order — benchmarking should come before feature work,
+and bitstream versioning should come before entropy coding changes. However, we are
+proceeding this way to get compression wins early.
+
+When continuing on a new computer, you should know:
+- Phases 1 and 2 are skipped for now
+- Phase 3 (entropy coding) comes after Phase 5 (intra modes)
+- The AI_AGENT_PROMPT.md and TODO.md reflect this non-standard order
+
 ## What's Done (Don't Re-do These)
 
 **Completed features (verified by tests):**
@@ -38,7 +56,7 @@ Then read the source files in src/ and neon/ to understand the implementation.
 
 ## What To Do Next (Priority Order)
 
-The remaining work from TODO.md, in priority order:
+The remaining work from TODO.md, in priority order (skipping Phases 1 and 2 for now):
 
 1. **Phase 3: Implement range coder** — entropy.c currently uses tANS framework but with Exp-Golomb. Implement proper range coder (range_coder.c) with encode/decode + renormalization. Wire into coefficient coding path replacing Exp-Golomb. This is the single biggest BD-rate win (~15-30%).
 
@@ -50,9 +68,13 @@ The remaining work from TODO.md, in priority order:
 
 5. **Phase 8: Add lookahead rate control** — Pre-analyze future frames for QP decisions. Buffer of 5-15 frames. Scene-aware complexity estimation. Improves CBR/VBR quality consistency.
 
-6. **Phase 1: Create benchmark harness** — tools/run_benchmark.sh for encode matrix. tools/evaluate_quality.py for VMAF/PSNR extraction. tools/bd_rate.py for BD-rate calculation. Test against x264, x265, SVT-AV1.
+6. **Phase 9: ARM/Mobile Decoder Optimization** — Full NEON kernel optimization, WPP row-dependency sync, memory management, Raspberry Pi benchmark.
 
-7. **Phase 0 remaining items** — Golden corpus directory, architecture diagrams in SPEC.md, large resolution test (1920x1080), long-run soak test (1000+ frames).
+7. **Phase 10: Ecosystem & Deployment** — Container format, FFmpeg integration, CLI improvements, conformance bitstreams.
+
+8. **Phase 1: Create benchmark harness** — **SKIPPED FOR NOW** — Should be done before Phase 3 ideally. tools/run_benchmark.sh for encode matrix. tools/evaluate_quality.py for VMAF/PSNR extraction. tools/bd_rate.py for BD-rate calculation. Test against x264, x265, SVT-AV1.
+
+9. **Phase 2: Rebuild Bitstream for Longevity** — **SKIPPED FOR NOW** — Should be done before Phase 3 ideally. Versioned bitstream syntax, profiles/levels, tool flags, random access points, tiles/slices.
 
 ## Key Architecture Notes
 
@@ -76,6 +98,16 @@ As of this session, the bitstream format has changed (version still 0 but encode
 - Intra mode encoding: 4 bits → 5 bits (18 modes now, was 9)
 - WPP bitstreams: entry point table added between header and row data
 - Non-WPP bitstreams: unchanged (sequential row-by-row)
+
+## Phase Order (Non-Standard — See Note Above)
+
+We're doing phases out of order. Correct Master Plan order is:
+Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → ...
+
+Our actual order:
+Phase 0 ✅ → Phase 5 ✅ → Phase 3 ⏸️ → Phase 4 ⏸️ → Phase 6 ⏸️ → Phase 7 ⏸️ → Phase 8 ⏸️ → Phase 9 ⏸️ → Phase 10 ⏸️ → Phase 1 ⚠️ → Phase 2 ⚠️
+
+Phases 1 and 2 are deferred until after the main codec features are done.
 ```
 
 ---

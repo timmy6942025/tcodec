@@ -295,7 +295,12 @@
 
 ## 🎯 IMPLEMENTATION PRIORITY ORDER
 
-The recommended execution order (highest impact first):
+**⚠️ Note: We are doing phases out of order.** The Master Plan recommends:
+Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → ...
+
+We have skipped Phases 1 (Benchmark Harness) and 2 (Bitstream Redesign) and are
+proceeding with compression wins first (Phase 5 → Phase 3 → Phase 4 → ...).
+Phases 1 and 2 will be done after the main codec features are complete.
 
 1. ~~**BUG-1** through **BUG-5**~~ — ✅ All fixed
 2. ~~**ACT-1** — Wire JND band weighting~~ — ✅ Done (~2-5% BD-rate)
