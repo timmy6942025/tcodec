@@ -17,6 +17,7 @@
 #include "tcodec_common.h"
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 /* ── Read frame header ──────────────────────────────────────── */
 
@@ -591,6 +592,11 @@ tc_error_t tc_decoder_decode(tc_decoder_t *dec,
 
     /* CTU grid */
     int num_ctu_rows = (hdr.height + TC_CTU_SIZE - 1) / TC_CTU_SIZE;
+    /* Sanity check: header dimensions should match stored dimensions.
+     * A mismatch could mean a malformed bitstream, but the entry point
+     * table is indexed by row, so we use the header value for correctness.
+     * Only assert in debug builds — release builds handle it gracefully. */
+    assert(num_ctu_rows == dec->num_ctu_rows);
 
     /* Check for WPP entry point table in bitstream.
      * When TC_FLAG_WPP is set, the bitstream contains an entry point
