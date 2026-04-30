@@ -293,7 +293,7 @@
 - [x] All-intra test — ✅ test_all_intra
 - [x] Rate control CBR test — ✅ test_rate_control_cbr
 - [x] Rate control VBR test — ✅ test_rate_control_vbr
-- [x] PSNR reporting validation test — ✅ test_psnr_reporting
+- [x] PSNR reporting validation — ✅ Verified via test_encode_decode_roundtrip and test_qp_range_quality_tradeoff
 
 ---
 

@@ -131,7 +131,7 @@ $(TEST_BIN): $(TEST_SRC) $(LIB_STATIC) | $(BUILD_DIR)
 	$(CC) $(COMMON_CFLAGS) -o $@ $< $(LIB_STATIC) $(ARCH_LDFLAGS) $(LDFLAGS) -lm
 
 test: $(TEST_BIN)
-	./$(TEST_BIN)
+	ulimit -v 4000000 2>/dev/null; ./$(TEST_BIN)
 
 bench: $(ENC_BIN) $(DEC_BIN)
 	@echo "Benchmark requires a YUV input file."
