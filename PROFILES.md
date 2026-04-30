@@ -1,8 +1,8 @@
-# TCodec Profiles and Levels — Version 0
+# TCodec Profiles and Levels — Version 0 and Version 1
 
-**Status**: Working prototype. No profiles or levels are enforced yet.  
-**Bitstream Version**: 0  
-**Last Updated**: Based on code audit of current implementation.
+**Status**: v1 profiles and levels implemented and enforced.  
+**Bitstream Versions**: 0 (no profile/level), 1 (profiles + levels + tool flags)  
+**Last Updated**: Phase 2 complete — v1 bitstream with profiles, levels, tool flags, RAP, CRC.
 
 ---
 
@@ -13,14 +13,14 @@ Profiles define **which coding tools a decoder must support**. Levels define
 announce its capabilities and for encoders to produce bitstreams that will
 decode successfully on a given class of device.
 
-**Current state**: No profiles or levels are defined, signaled, or enforced.
-The bitstream header has no profile/level fields. All coding tools are always
-active (or inactive, as the case may be — see tool status below).
+**Current state (v1)**: Profiles and levels are defined, signaled in the v1
+frame header, and validated by the decoder. The encoder populates profile/level
+and tool flags based on the configured profile and actual tool usage. v0
+bitstreams have no profile/level fields and default to baseline-mobile.
 
 This document serves as:
 1. A record of the **current tool inventory** and its activation status
-2. A **proposal** for the profile/level structure to be introduced in
-   bitstream version 1
+2. The **implemented** profile/level structure for bitstream version 1
 3. A **preset reference** for the existing encoder presets
 
 ---
@@ -76,27 +76,37 @@ This document serves as:
 
 ---
 
-## 3. Proposed Profiles
+## 3. Profiles (Implemented in v1)
 
-These profiles are **not yet implemented**. They represent the planned
-tool subsets for different deployment targets.
+These profiles are **implemented** in the v1 bitstream. The encoder
+populates tool flags based on actual tool usage; the decoder reads
+them and validates profile compliance.
 
-### 3.1 Profile 0: `baseline-mobile`
+### 3.1 Profile 0: `baseline-mobile` (TC_PROFILE_BASELINE_MOBILE = 0)
 
 **Target**: Raspberry Pi, mid-range Android phones, low-power embedded  
 **Decoder complexity**: Minimal — no tools that require significant
 per-block decision logic or memory.
 
+**v1 tool flags signaled** (always active in current encoder):
+- `TC_TOOL_SKIP_MERGE` — Skip/merge inter modes
+- `TC_TOOL_CFL_CHROMA` — Chroma-from-luma prediction
+- `TC_TOOL_JND_WEIGHTING` — JND band quantization weighting
+- `TC_TOOL_MEDIAN_MV_PRED` — Median MV predictor + MVD coding
+- `TC_TOOL_SIX_TAP_INTERP` — 6-tap luma interpolation
+
 | Tool | Supported |
 |------|-----------|
-| Intra modes 0–8 | ✅ |
+| 18-mode intra prediction | ✅ |
 | WHT 4×4 / 8×8 | ✅ |
-| Exp-Golomb coding | ✅ (or range coder if upgrade path works) |
+| tANS coefficient coding | ✅ |
 | Single-reference inter | ✅ |
-| Quarter-pel bilinear | ✅ |
-| Deblocking filter | ✅ (simplified) |
-| DC chroma prediction | ✅ |
-| Skip / merge | ✅ (when implemented) |
+| 6-tap luma interpolation | ✅ |
+| Deblocking filter | ✅ |
+| CfL chroma prediction | ✅ |
+| Skip / merge modes | ✅ |
+| JND band weighting | ✅ |
+| Median MV predictor | ✅ |
 | Multi-reference | ❌ |
 | Bi-prediction | ❌ |
 | 8-tap interpolation | ❌ |
@@ -111,25 +121,28 @@ optimization work (Phase 9). Every tool included must be measurable
 in NEON cycle count and must not push decode FPS below target on
 Raspberry Pi 4.
 
-### 3.2 Profile 1: `streaming-main`
+### 3.2 Profile 1: `streaming-main` (TC_PROFILE_STREAMING_MAIN = 1)
 
 **Target**: Streaming delivery to smart TVs, tablets, laptops  
 **Decoder complexity**: Moderate — adds tools that improve streaming
 quality at modest decode cost.
 
+**v1 tool flags signaled** (baseline-mobile tools +):
+- `TC_TOOL_MULTI_REF` — Multi-reference inter prediction (SLOW preset)
+
 | Tool | Supported |
 |------|-----------|
 | All baseline-mobile tools | ✅ |
-| Context-adaptive entropy coding | ✅ |
-| Real chroma intra prediction | ✅ |
+| Context-adaptive entropy coding | ✅ (PLANNED — Phase 3) |
+| CfL chroma prediction | ✅ |
 | Multiple reference frames (2–4) | ✅ |
 | 6-tap interpolation | ✅ |
 | Skip / merge modes | ✅ |
-| Deringing filter | ✅ |
-| SAO (if implemented) | ✅ |
+| Deringing filter | ❌ (PLANNED — Phase 7) |
+| SAO | ❌ (PLANNED — Phase 7) |
 | Rate control: CBR + capped VBR | ✅ |
 | Scene cut detection | ✅ |
-| Film grain synthesis | ✅ |
+| Film grain synthesis | ❌ (PLANNED — Phase 7) |
 | Bi-prediction | ❌ |
 | Loop restoration | ❌ |
 | Affine motion | ❌ |
@@ -138,39 +151,43 @@ quality at modest decode cost.
 beat practical H.264 streaming encodes on bitrate at matched VMAF,
 and approach HEVC-class compression on many content types.
 
-### 3.3 Profile 2: `archive-high`
+### 3.3 Profile 2: `archive-high` (TC_PROFILE_ARCHIVE_HIGH = 2)
 
 **Target**: Offline encoding, studio archive, post-production  
 **Decoder complexity**: High — no real-time decode requirement on ARM.
 Used on workstations and servers.
 
+**v1 tool flags**: Same as streaming-main (additional tools PLANNED for later phases).
+
 | Tool | Supported |
 |------|-----------|
 | All streaming-main tools | ✅ |
-| Bi-prediction (B-frames) | ✅ |
-| 8-tap interpolation | ✅ |
-| Loop restoration | ✅ |
-| Affine motion | ✅ |
-| Extended partition types | ✅ |
-| Scaling matrices | ✅ |
-| Encoder-side learned guidance | ✅ (encoder only) |
-| Deep lookahead | ✅ (encoder only) |
+| Bi-prediction (B-frames) | ❌ (PLANNED — Phase 6) |
+| 8-tap interpolation | ❌ (PLANNED — Phase 6) |
+| Loop restoration | ❌ (PLANNED — Phase 7) |
+| Affine motion | ❌ (PLANNED — Phase 6+) |
+| Extended partition types | ❌ (PLANNED — Phase 5) |
+| Scaling matrices | ❌ (PLANNED — Phase 4) |
+| Encoder-side learned guidance | ❌ (PLANNED) |
+| Deep lookahead | ❌ (PLANNED — Phase 8) |
 
 **Rationale**: Offline encoding can afford much higher encoder
 complexity. The decoder runs on capable hardware. The goal is
 maximum compression quality, not real-time ARM decode.
 
-### 3.4 Profile 3: `grain-cinema`
+### 3.4 Profile 3: `grain-cinema` (TC_PROFILE_GRAIN_CINEMA = 3)
 
 **Target**: Movie and prestige TV streaming with film grain  
 **Decoder complexity**: Similar to streaming-main plus grain synthesis.
 
+**v1 tool flags**: Same as streaming-main (grain tools PLANNED for Phase 7).
+
 | Tool | Supported |
 |------|-----------|
 | All streaming-main tools | ✅ |
-| Film grain synthesis | ✅ (required) |
-| Grain-aware quantization | ✅ |
-| Per-scene perceptual targeting | ✅ (encoder only) |
+| Film grain synthesis | ❌ (PLANNED — Phase 7, required in profile) |
+| Grain-aware quantization | ❌ (PLANNED — Phase 4) |
+| Per-scene perceptual targeting | ❌ (PLANNED — Phase 8) |
 
 **Rationale**: Film grain is one of the highest-leverage areas for
 bandwidth savings in movie streaming. Coding grain literally is
@@ -179,12 +196,14 @@ and encoder-side grain detection/removal.
 
 ---
 
-## 4. Proposed Levels
+## 4. Levels (Implemented in v1)
 
 Levels constrain **memory, throughput, and resolution** to ensure
 decoders can handle the bitstream within their resource budget.
 
-**Not yet implemented.** The following is a proposal.
+**Implemented** in v1 bitstream. The decoder validates frame dimensions
+and bitrate against the level table in `bitstream.c`. Level index is
+signaled in the `profile_level` header byte (lower 4 bits).
 
 ### 4.1 Level Parameters
 
@@ -194,29 +213,29 @@ Each level defines limits on:
 |-----------|-------------|
 | Max picture width | Pixels |
 | Max picture height | Pixels |
-| Max CTU columns | `ceil(width / 64)` |
-| Max CTU rows | `ceil(height / 64)` |
 | Max DPB slots | Reference frames stored simultaneously |
-| Max decode MB/s | Throughput requirement (luma samples/sec) |
 | Max bitrate | Coded bits per second |
-| Max tile columns | Parallel decode limit |
 
-### 4.2 Proposed Level Table
+### 4.2 Level Table (Implemented in `bitstream.c`)
 
-| Level | Max Width | Max Height | Max DPB | Max Samples/s | Max Bitrate | Target Device |
-|-------|-----------|------------|---------|---------------|-------------|---------------|
-| 1.0 | 320 | 240 | 1 | 2,304,000 | 500 kbps | IoT / very low power |
-| 1.1 | 640 | 480 | 2 | 9,216,000 | 2 Mbps | Raspberry Pi 2 |
-| 2.0 | 1280 | 720 | 2 | 16,588,800 | 5 Mbps | Raspberry Pi 4 |
-| 2.1 | 1280 | 720 | 4 | 33,177,600 | 10 Mbps | Mid-range Android |
-| 3.0 | 1920 | 1080 | 4 | 124,416,000 | 20 Mbps | Raspberry Pi 5, good phone |
-| 3.1 | 1920 | 1080 | 4 | 124,416,000 | 40 Mbps | High-end phone, tablet |
-| 4.0 | 3840 | 2160 | 4 | 497,664,000 | 80 Mbps | Smart TV, laptop |
-| 4.1 | 3840 | 2160 | 8 | 497,664,000 | 160 Mbps | Desktop, server |
+| Level | Index | Max Width | Max Height | Max DPB | Max Bitrate | Target Device |
+|-------|-------|-----------|------------|---------|-------------|---------------|
+| Auto | 0 | 4096 | 4096 | 8 | Unlimited | No constraints |
+| 1.0 | 1 | 320 | 240 | 1 | 500 kbps | IoT / very low power |
+| 1.1 | 2 | 640 | 480 | 2 | 2 Mbps | Raspberry Pi 2 |
+| 2.0 | 3 | 1280 | 720 | 2 | 5 Mbps | Raspberry Pi 4 |
+| 2.1 | 4 | 1280 | 720 | 4 | 10 Mbps | Mid-range Android |
+| 3.0 | 5 | 1920 | 1080 | 4 | 20 Mbps | Raspberry Pi 5, good phone |
+| 3.1 | 6 | 1920 | 1080 | 4 | 40 Mbps | High-end phone, tablet |
+| 4.0 | 7 | 3840 | 2160 | 4 | 80 Mbps | Smart TV, laptop |
+| 4.1 | 8 | 3840 | 2160 | 8 | 160 Mbps | Desktop, server |
+
+**Decoder validation**: When a v1 bitstream has a level other than Auto,
+the decoder checks that frame dimensions don't exceed the level's max
+width/height. CRC mismatch is also detected and reported via
+`tc_decoder_crc_valid()`.
 
 **Notes**:
-- Max Samples/s = `width × height × fps_max`, assuming 30 fps for levels ≤ 2.1
-  and 60 fps for levels ≥ 3.0
 - Level 3.0 and 3.1 share the same sample rate but differ in bitrate ceiling
 - DPB slots may be further constrained by profile (baseline-mobile: 1–2)
 - These levels are provisional and must be validated with real decode
@@ -288,52 +307,67 @@ encoder used.
 
 ---
 
-## 6. Profile Signaling (Proposed for Bitstream v1)
+## 6. Profile Signaling (Implemented in v1)
 
-The frame header currently has no profile/level fields. The proposed
-addition for bitstream version 1:
+The v1 frame header includes profile/level and tool flags. See BITSTREAM.md §3.2
+for the full header layout.
 
-### 6.1 Header Extension
-
-```
-Bit Offset  Width  Field           Description
-──────────  ─────  ──────────────  ──────────────────────
-24–31       8      version         0x01 (version 1)
-...
-72–79       8      qp_delta        (unchanged)
-80–87       8      frame_num       (unchanged)
-88–91       4      profile         0=baseline-mobile, 1=streaming-main,
-                                    2=archive-high, 3=grain-cinema
-92–95       4      level_idx       Level index (see level table)
-96          1      tool_flags_ext  1 = extended tool flags follow
-97–103      7      reserved        Must be 0
-```
-
-### 6.2 Extended Tool Flags (Optional)
-
-If `tool_flags_ext = 1`, a variable-length tool flag section follows,
-indicating which optional tools are active in this frame:
+### 6.1 Header Fields (v1)
 
 ```
-Bit   Field                  Profile Required
-───   ─────────────────────  ───────────────
-0     entropy_coded           streaming-main+
-1     multi_ref               streaming-main+
-2     skip_merge              baseline-mobile+
-3     deringing               streaming-main+
-4     sao                     streaming-main+
-5     grain_synthesis         grain-cinema
-6     bipred                  archive-high
-7     loop_restoration        archive-high
-8     affine_motion           archive-high
-9     extended_partition      archive-high
-10    six_tap_interpolate     streaming-main+
-11    real_chroma_intra       streaming-main+
-12–15 reserved                Must be 0
+Byte Offset  Field           Description
+───────────  ──────────────  ──────────────────────
+0–2          magic           0x54 0x43 0x56 ("TCV")
+3            version         0x01 (version 1)
+4–5          width           Frame width (16-bit LE)
+6–7          height          Frame height (16-bit LE)
+8            flags           Bitfield: key(1) wpp(1) rap(1) crc(1) ext(1) tile_c(2) tile_r(2)
+9            qp_delta        Signed offset from QP 32
+10           frame_num       Frame counter (low 8 bits)
+11           profile_level   (profile << 4) | (level_idx & 0x0F)
+12–13        tool_flags      16-bit tool flag bitfield
 ```
 
-A decoder for profile N silently ignores tools that are not in its
+### 6.2 Tool Flags (v1, 16-bit)
+
+Signaled in every v1 frame. Indicates which coding tools are **actually used**
+by the encoder for this frame.
+
+```
+Bit   Field                  Profile Required       Constant
+───   ─────────────────────  ───────────────        ───────────────
+0     skip_merge              baseline-mobile+       TC_TOOL_SKIP_MERGE
+1     cfl_chroma              baseline-mobile+       TC_TOOL_CFL_CHROMA
+2     jnd_weighting           baseline-mobile+       TC_TOOL_JND_WEIGHTING
+3     median_mv_pred          baseline-mobile+       TC_TOOL_MEDIAN_MV_PRED
+4     six_tap_interp          baseline-mobile+       TC_TOOL_SIX_TAP_INTERP
+5     multi_ref               streaming-main+        TC_TOOL_MULTI_REF
+6     deringing               streaming-main+       (PLANNED Phase 7)
+7     sao                     streaming-main+       (PLANNED Phase 7)
+8     grain_synthesis         grain-cinema          (PLANNED Phase 7)
+9     bipred                  archive-high          (PLANNED Phase 6)
+10    loop_restoration        archive-high          (PLANNED Phase 7)
+11    affine_motion           archive-high          (PLANNED Phase 6+)
+12    extended_partition      archive-high          (PLANNED Phase 5)
+13    entropy_coded           streaming-main+       (PLANNED Phase 3)
+14    real_chroma_intra       streaming-main+       (PLANNED Phase 5)
+15    reserved                —                      Must be 0
+```
+
+A decoder for profile N silently ignores tool flags that are not in its
 profile (it must not encounter them if the encoder is compliant).
+
+### 6.3 Flags Field (v1 additions)
+
+The flags byte in v1 adds two new bits:
+
+```
+Bit   Field     Description
+───   ───────   ──────────────────────────────────────────────
+2     rap       Random Access Point — frame can be decoded independently
+3     crc       CRC-16 appended after frame data for error detection
+4     ext       Extended header follows (future use, not yet implemented)
+```
 
 ---
 
@@ -341,13 +375,11 @@ profile (it must not encounter them if the encoder is compliant).
 
 When new tools or profiles are introduced:
 
-1. **Bitstream version increments** — old decoders reject the new version
-2. **New profile values** — old decoders that only know profile 0–3
-   reject unknown profiles
-3. **Tool flags** — decoders only parse tools their profile supports;
-   unknown flag bits are ignored
-4. **Optional syntax sections** — guarded by flag bits; decoders that
-   don't support a tool skip its syntax section entirely
+1. **Bitstream version increments** — v0 decoders reject v1 bitstreams (version byte check); v1 decoders accept v0 and v1, reject v2+
+2. **New profile values** — decoders that only know profile 0–3 reject unknown profiles
+3. **Tool flags** — decoders only parse tools their profile supports; unknown flag bits are ignored
+4. **Optional syntax sections** — guarded by flag bits; decoders that don't support a tool skip its syntax section entirely
+5. **v0 → v1 migration** — v0 frames (12-byte header, reserved=0) decode correctly on v1 decoders; v1 defaults (profile=baseline-mobile, level=auto) are backward-compatible
 
 This ensures that:
 - A baseline-mobile decoder never needs to understand archive-high syntax

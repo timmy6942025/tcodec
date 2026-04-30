@@ -76,6 +76,22 @@ uint32_t tc_bs_reader_read_ue(tc_bs_reader_t *r);
 int32_t  tc_bs_reader_read_se(tc_bs_reader_t *r);
 int      tc_bs_reader_eof(tc_bs_reader_t *r);
 
+/* ── CRC-16 (CCITT) for v1 bitstream error detection ────────── */
+
+uint16_t tc_crc16(const uint8_t *data, size_t len);
+
+/* ── v1 level constraints table ─────────────────────────────── */
+
+typedef struct tc_level_info {
+    int32_t  max_width;
+    int32_t  max_height;
+    int32_t  max_dpb;
+    int64_t  max_bitrate;      /* bps */
+} tc_level_info_t;
+
+/* Level constraint lookup by level_idx (0 = auto/none) */
+const tc_level_info_t *tc_level_get_info(int level_idx);
+
 /* ── Frame buffer management ─────────────────────────────────── */
 
 tc_frame_buf_t *tc_frame_alloc(int width, int height);
@@ -343,6 +359,8 @@ typedef struct tc_decoder {
 #endif
     /* Output packet info */
     tc_frame_header_t last_header;
+    /* v1 bitstream validation results */
+    int             last_crc_valid;   /* 1 = CRC OK or no CRC, 0 = CRC mismatch */
 } tc_decoder_t;
 
 /* ── PSNR computation ────────────────────────────────────────── */

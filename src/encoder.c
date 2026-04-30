@@ -201,9 +201,11 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
         if (enc->cfg.preset == TC_PRESET_SLOW)       search_range = 64;
 
         /* Try each reference frame in DPB.
-         * Only search multiple refs on SLOW preset — ULTRAFAST/FAST/MEDIUM
-         * only use the most recent reference (slot 0) to keep ME cost down. */
-        int max_refs = (enc->cfg.preset == TC_PRESET_SLOW) ? TC_REF_FRAMES : 1;
+         * Only search multiple refs on SLOW preset AND streaming-main+ profile.
+         * Baseline-mobile profile must never produce multi-ref bitstreams —
+         * a baseline-mobile decoder wouldn't know how to handle ref_idx. */
+        int max_refs = (enc->cfg.preset == TC_PRESET_SLOW &&
+                        enc->cfg.profile >= TC_PROFILE_STREAMING_MAIN) ? TC_REF_FRAMES : 1;
         for (int ri = 0; ri < max_refs; ri++) {
             const tc_frame_buf_t *rframe = enc->dpb[ri].frame;
             if (!rframe) continue;
@@ -706,6 +708,7 @@ static void encode_row(void *ctx, int row)
 
 static void write_frame_header(tc_bs_writer_t *bs, tc_frame_header_t *hdr)
 {
+    /* Common fields (v0 and v1) */
     tc_bs_writer_write_bits(bs, hdr->magic[0], 8);
     tc_bs_writer_write_bits(bs, hdr->magic[1], 8);
     tc_bs_writer_write_bits(bs, hdr->magic[2], 8);
@@ -715,7 +718,17 @@ static void write_frame_header(tc_bs_writer_t *bs, tc_frame_header_t *hdr)
     tc_bs_writer_write_bits(bs, hdr->flags, 8);
     tc_bs_writer_write_bits(bs, hdr->qp_delta, 8);
     tc_bs_writer_write_bits(bs, hdr->frame_num, 8);
-    tc_bs_writer_write_bits(bs, hdr->reserved, 8);
+
+    /* v0: reserved byte; v1: profile_level + tool_flags */
+    if (hdr->version == TC_VERSION_V0) {
+        tc_bs_writer_write_bits(bs, 0, 8);  /* reserved */
+    } else {
+        /* v1: profile_level byte = (profile << 4) | level_idx */
+        tc_bs_writer_write_bits(bs, hdr->profile_level, 8);
+        /* v1: tool_flags (16 bits) */
+        tc_bs_writer_write_bits(bs, hdr->tool_flags, 16);
+    }
+
     tc_bs_writer_byte_align(bs);
 }
 
@@ -928,19 +941,72 @@ tc_error_t tc_encoder_encode(tc_encoder_t *enc,
 
     /* Write frame header */
     tc_frame_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
     hdr.magic[0] = TC_MAGIC_0;
     hdr.magic[1] = TC_MAGIC_1;
     hdr.magic[2] = TC_MAGIC_2;
-    hdr.version  = TC_VERSION;
+    hdr.version  = enc->cfg.bitstream_version;
     hdr.width    = (uint16_t)enc->cfg.width;
     hdr.height   = (uint16_t)enc->cfg.height;
     hdr.flags    = is_key ? TC_FLAG_KEY_FRAME : 0;
 #if !defined(TCODEC_NO_THREADS)
     if (enc->use_wpp) hdr.flags |= TC_FLAG_WPP;
 #endif
-    hdr.qp_delta = (uint8_t)(int8_t)(qp - TC_QP_DEFAULT);
+
+    /* v1-specific header fields */
+    if (hdr.version == TC_VERSION_V1) {
+        /* Random Access Point: all key frames are RAPs.
+         * RAP frames can be decoded independently — no reference
+         * to prior frames is needed. Essential for seek/seeking. */
+        if (is_key) hdr.flags |= TC_FLAG_RAP;
+
+        /* CRC: append error detection if enabled */
+        if (enc->cfg.enable_crc) hdr.flags |= TC_FLAG_CRC;
+
+        /* Profile and level */
+        uint8_t profile = enc->cfg.profile;
+        uint8_t level_idx = enc->cfg.level_idx;
+        if (profile > TC_PROFILE_MAX) profile = TC_PROFILE_BASELINE_MOBILE;
+        if (level_idx > TC_LEVEL_MAX) level_idx = TC_LEVEL_AUTO;
+        hdr.profile_level = (uint8_t)((profile << 4) | (level_idx & 0x0F));
+        hdr.profile   = profile;
+        hdr.level_idx = level_idx;
+
+        /* Tool flags: signal which coding tools are ACTUALLY used by
+         * the encoder for this frame. The decoder needs this to know
+         * which syntax elements to expect. Profile compliance means
+         * the encoder must not use tools outside the profile, but the
+         * tool_flags field reflects actual usage, not profile capability. */
+        uint16_t tools = 0;
+        /* These tools are always active in the current encoder: */
+        tools |= TC_TOOL_SKIP_MERGE;      /* Skip/merge inter modes */
+        tools |= TC_TOOL_CFL_CHROMA;      /* Chroma-from-luma prediction */
+        tools |= TC_TOOL_JND_WEIGHTING;   /* JND band quantization weighting */
+        tools |= TC_TOOL_MEDIAN_MV_PRED;  /* Median MV predictor + MVD coding */
+        tools |= TC_TOOL_SIX_TAP_INTERP;  /* 6-tap luma interpolation (always used) */
+        /* Multi-reference: only when SLOW preset AND profile allows it.
+         * Profile compliance: baseline-mobile decoders must never encounter
+         * multi-ref syntax in their bitstreams. */
+        if (enc->cfg.preset == TC_PRESET_SLOW &&
+            profile >= TC_PROFILE_STREAMING_MAIN) {
+            tools |= TC_TOOL_MULTI_REF;
+        }
+        /* Future tools (not yet implemented):
+         * TC_TOOL_ENTROPY_CODED  — context-modeled entropy (Phase 3)
+         * TC_TOOL_DERINGING      — directional deringing (Phase 7)
+         * TC_TOOL_SAO            — sample adaptive offset (Phase 7)
+         * TC_TOOL_GRAIN_SYNTHESIS — film grain synthesis (Phase 7)
+         * TC_TOOL_BIPRED         — bi-prediction (Phase 6)
+         */
+
+        hdr.tool_flags = tools;
+        hdr.is_rap       = is_key ? 1 : 0;
+        hdr.has_crc      = enc->cfg.enable_crc ? 1 : 0;
+        hdr.has_ext_header = 0;  /* No extension headers yet */
+    }
+
+    hdr.qp_delta  = (uint8_t)(int8_t)(qp - TC_QP_DEFAULT);
     hdr.frame_num = (uint8_t)(enc->frame_count & 0xFF);
-    hdr.reserved  = 0;
     hdr.frame_type = frame_type;
     hdr.qp = (uint8_t)qp;
 
@@ -1034,6 +1100,17 @@ tc_error_t tc_encoder_encode(tc_encoder_t *enc,
         /* Flush tANS (shared across all rows) */
         tc_tans_enc_flush(&enc->tans);
         tc_bs_writer_byte_align(&enc->bs);
+    }
+
+    /* Append CRC-16 if v1 with TC_FLAG_CRC set */
+    if (hdr.version == TC_VERSION_V1 && hdr.has_crc) {
+        /* CRC covers header + CTU data (everything up to but not
+         * including the CRC bytes themselves). Compute from the
+         * output buffer and append the 2-byte CRC. */
+        size_t payload_bytes = tc_bs_writer_bytes(&enc->bs);
+        uint16_t crc = tc_crc16(enc->out_buf, payload_bytes);
+        tc_bs_writer_write_bits(&enc->bs, (uint32_t)(crc >> 8), 8);
+        tc_bs_writer_write_bits(&enc->bs, (uint32_t)(crc & 0xFF), 8);
     }
 
     /* Update rate control */

@@ -1,8 +1,8 @@
-# TCodec Specification — Version 0
+# TCodec Specification — Version 0 and Version 1
 
 **Status**: Working prototype, not production-grade.  
-**Bitstream Version**: 0 (not yet frozen)  
-**Last Updated**: Based on code audit of current implementation.
+**Bitstream Versions**: 0 (legacy), 1 (current)  
+**Last Updated**: Phase 2 complete — v1 bitstream with profiles, levels, tool flags, RAP, CRC.
 
 This document specifies what TCodec **actually implements**. Where the
 README makes claims not backed by code, this spec marks them as
@@ -21,8 +21,9 @@ README makes claims not backed by code, this spec marks them as
 | **Prediction Unit (PU)** | Same region as the block (8×8). Intra or inter decision is per-block. |
 | **Frame** | One complete image: luma (Y) at full resolution, Cb and Cr at half resolution (4:2:0). |
 | **DPB** (Decoded Picture Buffer) | Stores reference frames for inter prediction. Current size: 4 slots. |
-| **Profile** | A subset of coding tools. No profiles defined yet. |
-| **Level** | Performance constraints. No levels defined yet. |
+| **Profile** | A subset of coding tools (baseline-mobile, streaming-main, archive-high, grain-cinema). |
+| **Level** | Performance constraints (1.0 through 4.1). |
+| **RAP** | Random Access Point — frame that can be decoded independently. |
 | **QP** (Quantization Parameter) | Integer 0–63 controlling quantization step size. |
 | **MVD** (Motion Vector Difference) | Signed displacement from the median MV predictor, in quarter-pel units. |
 
@@ -406,7 +407,7 @@ uses bilinear interpolation while the scalar version uses a proper
 
 ## 10. Implementation Status Summary
 
-### Working (Verified by Tests — 31 tests pass)
+### Working (Verified by Tests — 37 tests pass)
 
 - Encode/decode roundtrip for I-frames and P-frames
 - Intra prediction (18 modes, SAD mode decision)
@@ -441,8 +442,10 @@ uses bilinear interpolation while the scalar version uses a proper
 - Film grain synthesis
 - Real lookahead
 - VBV-constrained rate control (model exists, not validated)
-- Profiles and levels
-- Bitstream versioning / extensibility
+- Profiles and levels ~~(not implemented)~~ ✅ v1: baseline-mobile, streaming-main, archive-high, grain-cinema; Levels 1.0–4.1
+- Bitstream versioning ~~(not implemented)~~ ✅ v1: version field, v0/v1 header dispatch, v2+ rejected
+- Random access points ✅ v1: TC_FLAG_RAP marks keyframes as independent decodable
+- CRC-16 error detection ✅ v1: TC_FLAG_CRC enables CCITT CRC-16 after frame data
 - Container format integration
 - Bi-prediction / B-frames
 - Quadtree partitioning
@@ -557,11 +560,11 @@ uses bilinear interpolation while the scalar version uses a proper
                           (Y, Cb, Cr planes)
 ```
 
-### A.3 Bitstream Structure
+### A.3 Bitstream Structure (v0)
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
-  │  FRAME HEADER (12 bytes, byte-aligned)                         │
+  │  FRAME HEADER v0 (12 bytes, byte-aligned)                      │
   │  ┌───────┬───────┬───────┬───────┬──────┬──────┬──────┬──────┐  │
   │  │ Magic │ Magic │ Magic │ Vers  │ Width│ Height│Flags │ QPΔ  │  │
   │  │ 0x54  │ 0x43  │ 0x56  │ =0    │ 16b  │ 16b  │ 8b   │ 8b   │  │
@@ -571,17 +574,26 @@ uses bilinear interpolation while the scalar version uses a proper
   │  │ 8b   │ 8b   │                                         │
   │  └──────┴──────┘                                             │
   └─────────────────────────────────────────────────────────────────┘
+```
+
+### A.4 Bitstream Structure (v1)
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  FRAME HEADER v1 (14 bytes, byte-aligned)                      │
+  │  ┌───────┬───────┬───────┬───────┬──────┬──────┬──────┬──────┐  │
+  │  │ Magic │ Magic │ Magic │ Vers  │ Width│ Height│Flags │ QPΔ  │  │
+  │  │ 0x54  │ 0x43  │ 0x56  │ =1    │ 16b  │ 16b  │ 8b   │ 8b   │  │
+  │  └───────┴───────┴───────┴───────┴──────┴──────┴──────┴──────┘  │
+  │  ┌──────┬──────────────┬──────────────┐                        │
+  │  │ Frm# │ ProfLvl      │ ToolFlags    │  Flags: key(1) wpp(1)  │
+  │  │ 8b   │ 8b           │ 16b          │   rap(1) crc(1) ext(1) │
+  │  └──────┴──────────────┴──────────────┘   tile_c(2) tile_r(2) │
+  └─────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼ (if TC_FLAG_WPP)
   ┌─────────────────────────────────────────────────────────────────┐
-  │  WPP ENTRY POINT TABLE                                         │
-  │  ┌──────────────────┐  ┌──────────────────┐                     │
-  │  │ num_rows (16b EG) │  │ offset[0] (EG)   │                     │
-  │  └──────────────────┘  ├──────────────────┤                     │
-  │                         │ offset[1] (EG)   │                     │
-  │                         ├──────────────────┤                     │
-  │                         │ ...              │                     │
-  │                         └──────────────────┘                     │
+  │  WPP ENTRY POINT TABLE (same as v0)                            │
   └─────────────────────────────────────────────────────────────────┘
                                    │
                                    ▼
@@ -591,5 +603,11 @@ uses bilinear interpolation while the scalar version uses a proper
   │                                                                │
   │  Per-block: mode(2b) + [intra_mode(5b) | ref_idx(2b)+MVD(se)]  │
   │             + dct_flag(1b) + tANS coefficients                 │
+  └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼ (if TC_FLAG_CRC, v1 only)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  CRC-16 (2 bytes, big-endian)                                  │
+  │  Covers header + all row data (not the CRC itself)             │
   └─────────────────────────────────────────────────────────────────┘
 ```

@@ -25,6 +25,8 @@ static tc_error_t read_frame_header(tc_bs_reader_t *bs, tc_frame_header_t *hdr)
 {
     if (tc_bs_reader_eof(bs)) return TC_ERR_EOF;
 
+    memset(hdr, 0, sizeof(*hdr));
+
     hdr->magic[0] = (uint8_t)tc_bs_reader_read_bits(bs, 8);
     hdr->magic[1] = (uint8_t)tc_bs_reader_read_bits(bs, 8);
     hdr->magic[2] = (uint8_t)tc_bs_reader_read_bits(bs, 8);
@@ -38,10 +40,9 @@ static tc_error_t read_frame_header(tc_bs_reader_t *bs, tc_frame_header_t *hdr)
     hdr->version    = (uint8_t)tc_bs_reader_read_bits(bs, 8);
 
     /* Version check: reject incompatible future versions.
-     * Version 0 is the only defined version. If the bitstream
-     * has a different version, the codec structure may have changed
-     * in ways we can't safely decode. */
-    if (hdr->version > TC_VERSION) {
+     * We support v0 and v1. v2+ bitstreams may have different
+     * header structure or coding tools we don't understand. */
+    if (hdr->version > TC_VERSION_V1) {
         return TC_ERR_BITSTREAM;
     }
 
@@ -50,9 +51,52 @@ static tc_error_t read_frame_header(tc_bs_reader_t *bs, tc_frame_header_t *hdr)
     hdr->flags      = (uint8_t)tc_bs_reader_read_bits(bs, 8);
     hdr->qp_delta   = (uint8_t)tc_bs_reader_read_bits(bs, 8);
     hdr->frame_num  = (uint8_t)tc_bs_reader_read_bits(bs, 8);
-    hdr->reserved   = (uint8_t)tc_bs_reader_read_bits(bs, 8);
 
-    /* Derived fields */
+    /* Version-dependent header fields */
+    if (hdr->version == TC_VERSION_V0) {
+        /* v0: reserved byte (ignored) */
+        tc_bs_reader_read_bits(bs, 8);
+        hdr->profile_level = 0;
+        hdr->tool_flags = 0;
+        hdr->profile = TC_PROFILE_BASELINE_MOBILE;
+        hdr->level_idx = TC_LEVEL_AUTO;
+        hdr->is_rap = 0;
+        hdr->has_crc = 0;
+        hdr->has_ext_header = 0;
+    } else {
+        /* v1: profile_level byte + tool_flags (16 bits) */
+        hdr->profile_level = (uint8_t)tc_bs_reader_read_bits(bs, 8);
+        hdr->tool_flags    = (uint16_t)tc_bs_reader_read_bits(bs, 16);
+
+        /* Extract profile and level from packed byte */
+        hdr->profile   = (hdr->profile_level >> 4) & 0x0F;
+        hdr->level_idx = hdr->profile_level & 0x0F;
+
+        /* Validate profile */
+        if (hdr->profile > TC_PROFILE_MAX) {
+            /* Unknown profile — cannot decode safely */
+            return TC_ERR_BITSTREAM;
+        }
+
+        /* Derived v1 flags */
+        hdr->is_rap       = (hdr->flags & TC_FLAG_RAP) ? 1 : 0;
+        hdr->has_crc      = (hdr->flags & TC_FLAG_CRC) ? 1 : 0;
+        hdr->has_ext_header = (hdr->flags & TC_FLAG_EXT_HEADER) ? 1 : 0;
+
+        /* Validate level constraints (if explicit level set) */
+        if (hdr->level_idx > 0 && hdr->level_idx <= TC_LEVEL_MAX) {
+            const tc_level_info_t *lvl = tc_level_get_info(hdr->level_idx);
+            if (hdr->width > lvl->max_width || hdr->height > lvl->max_height) {
+                return TC_ERR_BITSTREAM;  /* Exceeds level constraints */
+            }
+        }
+
+        /* v0 reserved bits 5-3 must be 0 for v0 compatibility.
+         * For v1, bits 5-3 are RAP/CRC/EXT — no additional validation needed
+         * since they have well-defined meanings. */
+    }
+
+    /* Derived fields (common to v0 and v1) */
     hdr->frame_type = (hdr->flags & TC_FLAG_KEY_FRAME) ? TC_FRAME_KEY : TC_FRAME_INTER;
     /* qp_delta is stored as uint8_t but was encoded as (int8_t)(qp - TC_QP_DEFAULT).
      * Cast through int8_t to correctly handle signed values (QP < 32). */
@@ -537,6 +581,12 @@ void tc_decoder_get_info(tc_decoder_t *dec, int32_t *width, int32_t *height)
     if (height) *height = dec->height;
 }
 
+int tc_decoder_crc_valid(tc_decoder_t *dec)
+{
+    if (!dec) return 0;
+    return dec->last_crc_valid;
+}
+
 /* ── Main decode function ────────────────────────────────────── */
 
 tc_error_t tc_decoder_decode(tc_decoder_t *dec,
@@ -588,6 +638,29 @@ tc_error_t tc_decoder_decode(tc_decoder_t *dec,
     if (dec->ctu_data) {
         memset(dec->ctu_data, 0,
             (size_t)dec->num_ctu_cols * dec->num_ctu_rows * sizeof(tc_ctu_info_t));
+    }
+
+    /* CRC validation for v1 bitstreams with TC_FLAG_CRC set.
+     * The CRC-16 covers header + CTU data (everything before the 2 CRC bytes).
+     * The CRC is the last 2 bytes of the input. Validate before decoding
+     * so the result is available to the caller via last_crc_valid.
+     * Graceful degradation: we still decode the frame even on CRC mismatch,
+     * but the caller can check last_crc_valid to detect corruption. */
+    dec->last_crc_valid = 1;  /* Default: OK (no CRC or CRC matches) */
+    if (hdr.version == TC_VERSION_V1 && hdr.has_crc) {
+        if (size >= 2) {
+            size_t crc_pos = size - 2;
+            uint16_t stored_crc = (uint16_t)((data[crc_pos] << 8) | data[crc_pos + 1]);
+            uint16_t computed_crc = tc_crc16(data, crc_pos);
+            if (computed_crc != stored_crc) {
+                dec->last_crc_valid = 0;
+                /* CRC mismatch: corruption detected. We still decode
+                 * the frame (graceful degradation) but expose the
+                 * validation result to the caller. */
+            }
+        } else {
+            dec->last_crc_valid = 0;  /* CRC requested but data too short */
+        }
     }
 
     /* CTU grid */

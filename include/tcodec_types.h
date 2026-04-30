@@ -62,10 +62,17 @@ extern "C" {
 #define TC_MAGIC_0  0x54  /* 'T' */
 #define TC_MAGIC_1  0x43  /* 'C' */
 #define TC_MAGIC_2  0x56  /* 'V' */
-#define TC_VERSION  0
 
-/* Frame header size */
-#define TC_FRAME_HEADER_SIZE 12
+/* Bitstream versions */
+#define TC_VERSION_V0  0   /* Original 12-byte header, no profile/level/tool flags */
+#define TC_VERSION_V1  1   /* 14-byte header with profile, level, tool_flags, RAP, CRC */
+
+/* Default version for new encodes */
+#define TC_VERSION     TC_VERSION_V1
+
+/* Frame header sizes by version */
+#define TC_FRAME_HEADER_SIZE_V0  12
+#define TC_FRAME_HEADER_SIZE_V1  14
 
 /* ── Pixel types ─────────────────────────────────────────────── */
 
@@ -82,6 +89,32 @@ typedef enum {
     TC_FRAME_INTER   = 1,              /* P-frame with 1 reference */
     TC_FRAME_BIDIR   = 2,              /* B-frame with 2 references (future) */
 } tc_frame_type_t;
+
+/* ── Profiles ──────────────────────────────────────────────── */
+
+typedef enum {
+    TC_PROFILE_BASELINE_MOBILE = 0,  /* Low-power ARM decoder */
+    TC_PROFILE_STREAMING_MAIN  = 1,  /* Primary streaming profile */
+    TC_PROFILE_ARCHIVE_HIGH    = 2,  /* Offline / studio quality */
+    TC_PROFILE_GRAIN_CINEMA    = 3,  /* Film grain synthesis required */
+} tc_profile_t;
+
+#define TC_PROFILE_MAX  3
+
+/* ── Levels ─────────────────────────────────────────────────── */
+
+/* Level index → constraints table (see PROFILES.md §4)
+ * Index 0 = auto (no constraint), 1..8 = explicit levels */
+#define TC_LEVEL_AUTO   0
+#define TC_LEVEL_1_0    1   /* 320×240,  500 kbps, 1 DPB */
+#define TC_LEVEL_1_1    2   /* 640×480,  2 Mbps,  2 DPB */
+#define TC_LEVEL_2_0    3   /* 1280×720, 5 Mbps,  2 DPB */
+#define TC_LEVEL_2_1    4   /* 1280×720, 10 Mbps, 4 DPB */
+#define TC_LEVEL_3_0    5   /* 1920×1080, 20 Mbps, 4 DPB */
+#define TC_LEVEL_3_1    6   /* 1920×1080, 40 Mbps, 4 DPB */
+#define TC_LEVEL_4_0    7   /* 3840×2160, 80 Mbps, 4 DPB */
+#define TC_LEVEL_4_1    8   /* 3840×2160, 160 Mbps, 8 DPB */
+#define TC_LEVEL_MAX    8
 
 typedef enum {
     TC_BLOCK_4x4_ID  = 0,
@@ -180,26 +213,79 @@ typedef struct TCODEC_ALIGN(128) tc_ctu_info {
 /* ── Frame header ────────────────────────────────────────────── */
 
 typedef struct tc_frame_header {
+    /* ── Fields present in both v0 and v1 ── */
     uint8_t         magic[3];         /* 0x54, 0x43, 0x56 */
-    uint8_t         version;          /* 0 */
+    uint8_t         version;          /* 0 (v0) or 1 (v1) */
     uint16_t        width;            /* Frame width */
     uint16_t        height;           /* Frame height */
-    uint8_t         flags;            /* key_frame(1), tile bits */
-    uint8_t         qp_delta;         /* QP delta from previous */
+    uint8_t         flags;            /* key_frame, wpp, [rap, crc, ext], tile bits */
+    uint8_t         qp_delta;         /* QP delta from default (32) */
     uint8_t         frame_num;        /* Frame counter low 8 bits */
-    uint8_t         reserved;
-    /* Derived fields (not in bitstream) */
+
+    /* ── v1-only fields (v0: these don't exist in the bitstream) ── */
+    uint8_t         profile_level;    /* (profile << 4) | level_idx */
+    uint16_t        tool_flags;       /* Which coding tools are active */
+
+    /* ── Derived fields (not in bitstream) ── */
     tc_frame_type_t frame_type;
     uint8_t         qp;               /* Absolute QP for this frame */
     uint8_t         tile_cols_log2;
     uint8_t         tile_rows_log2;
+    uint8_t         profile;          /* Extracted from profile_level */
+    uint8_t         level_idx;        /* Extracted from profile_level */
+    int             is_rap;           /* Random Access Point */
+    int             has_crc;          /* CRC-16 present after frame data */
+    int             has_ext_header;   /* Extension header sections follow */
 } tc_frame_header_t;
 
-/* Frame header flags */
-#define TC_FLAG_KEY_FRAME   0x80
+/* Frame header flags (v0 and v1 share bits 7-6, tile bits 2-0)
+ * v0: bits 5-3 are reserved (must be 0)
+ * v1: bits 5-3 add RAP, CRC, ext_header */
+#define TC_FLAG_KEY_FRAME    0x80      /* 1 = I-frame */
 #define TC_FLAG_WPP          0x40      /* WPP row entry points present */
-#define TC_FLAG_TILE_C_MASK 0x0C      /* tile_cols_log2 in bits 2-3 */
-#define TC_FLAG_TILE_R_MASK 0x03      /* tile_rows_log2 in bits 0-1 */
+#define TC_FLAG_RAP          0x20      /* v1: Random Access Point */
+#define TC_FLAG_CRC          0x10      /* v1: CRC-16 after frame data */
+#define TC_FLAG_EXT_HEADER   0x08      /* v1: extension header sections follow */
+#define TC_FLAG_TILE_C_MASK  0x0C     /* tile_cols_log2 in bits 2-3 */
+#define TC_FLAG_TILE_R_MASK  0x03     /* tile_rows_log2 in bits 0-1 */
+
+/* ── Tool flags (16-bit, v1 header) ────────────────────────── */
+/* Indicates which coding tools are active for this frame.
+ * Decoder uses this to know which syntax elements to expect.
+ * Profile compliance: encoder must not set tools outside the profile. */
+
+#define TC_TOOL_SKIP_MERGE         (1u << 0)  /* Skip/merge inter modes */
+#define TC_TOOL_CFL_CHROMA        (1u << 1)  /* Chroma-from-luma prediction */
+#define TC_TOOL_JND_WEIGHTING     (1u << 2)  /* JND band quantization weighting */
+#define TC_TOOL_MEDIAN_MV_PRED    (1u << 3)  /* Median MV predictor + MVD coding */
+#define TC_TOOL_MULTI_REF         (1u << 4)  /* Multiple reference frames */
+#define TC_TOOL_SIX_TAP_INTERP    (1u << 5)  /* 6-tap luma interpolation filter */
+#define TC_TOOL_ENTROPY_CODED     (1u << 6)  /* Context-modeled entropy (future) */
+#define TC_TOOL_DERINGING         (1u << 7)  /* Directional deringing (future) */
+#define TC_TOOL_SAO               (1u << 8)  /* Sample Adaptive Offset (future) */
+#define TC_TOOL_GRAIN_SYNTHESIS   (1u << 9)  /* Film grain synthesis (future) */
+#define TC_TOOL_BIPRED            (1u << 10) /* Bi-prediction (future) */
+#define TC_TOOL_LOOP_RESTORATION  (1u << 11) /* Wiener-like restoration (future) */
+#define TC_TOOL_AFFINE_MOTION     (1u << 12) /* Affine motion model (future) */
+#define TC_TOOL_EXTENDED_PART     (1u << 13) /* Extended partition types (future) */
+#define TC_TOOL_CONTEXT_RESET     (1u << 14) /* Context model reset point */
+/* Bit 15 reserved (must be 0) */
+
+/* Default tool_flags per profile */
+#define TC_TOOLS_BASELINE_MOBILE  (TC_TOOL_SKIP_MERGE | TC_TOOL_CFL_CHROMA | \
+                                   TC_TOOL_JND_WEIGHTING | TC_TOOL_MEDIAN_MV_PRED)
+#define TC_TOOLS_STREAMING_MAIN   (TC_TOOLS_BASELINE_MOBILE | \
+                                   TC_TOOL_MULTI_REF | TC_TOOL_SIX_TAP_INTERP)
+#define TC_TOOLS_ARCHIVE_HIGH     (TC_TOOLS_STREAMING_MAIN)
+#define TC_TOOLS_GRAIN_CINEMA     (TC_TOOLS_STREAMING_MAIN | TC_TOOL_GRAIN_SYNTHESIS)
+
+/* ── Extension header types (v1) ────────────────────────────── */
+#define TC_EXT_END                0x00  /* End of extension header */
+#define TC_EXT_FILM_GRAIN_PARAMS  0x01  /* Film grain synthesis parameters */
+#define TC_EXT_MASTERING_METADATA 0x02 /* HDR colour volume metadata */
+#define TC_EXT_FRAME_RATE_INFO    0x03 /* Precise frame rate */
+#define TC_EXT_CONTENT_LIGHT_INFO 0x04 /* MaxCLL/MaxFALL for HDR */
+#define TC_EXT_RECOVERY_POINT     0x05 /* Recovery frame count after RAP */
 
 /* ── Frame buffer ────────────────────────────────────────────── */
 
@@ -240,6 +326,11 @@ typedef struct tc_config {
     int32_t         threads;          /* Number of WPP threads (0 = auto) */
     int32_t         tile_cols;        /* Number of tile columns (0 = auto) */
     int32_t         tile_rows;        /* Number of tile rows (0 = auto) */
+    /* v1 bitstream fields */
+    uint8_t         bitstream_version;/* 0 = legacy v0, 1 = v1 (default) */
+    uint8_t         profile;          /* tc_profile_t */
+    uint8_t         level_idx;        /* Level index (0 = auto) */
+    int             enable_crc;      /* 1 = add CRC-16 to frames (v1 only) */
 } tc_config_t;
 
 #ifdef __cplusplus

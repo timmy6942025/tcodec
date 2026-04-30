@@ -752,7 +752,8 @@ static void test_multi_ref(void)
     tc_config_t cfg;
     tc_config_defaults(&cfg, w, h);
     cfg.qp = 30;
-    cfg.preset = TC_PRESET_SLOW;   /* Enables multi-ref search (4 DPB slots) */
+    cfg.preset = TC_PRESET_SLOW;          /* Enables multi-ref search */
+    cfg.profile = TC_PROFILE_STREAMING_MAIN; /* Required: baseline-mobile gates multi-ref */
     cfg.keyframe_interval = 30;    /* Single keyframe, many P-frames */
 
     tc_encoder_t *enc = tc_encoder_create(&cfg);
@@ -1598,6 +1599,500 @@ static void test_wpp_roundtrip(void)
     PASS();
 }
 
+/* ── Test: v1 bitstream version field ─────────────────────── */
+
+static void test_v1_bitstream_version(void)
+{
+    TEST(v1_bitstream_version_field);
+    int w = 64, h = 64;
+
+    /* Encode with v1 (default) */
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    /* Default bitstream_version is V1 */
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "v1 encode failed");
+
+    /* Verify version byte is 1 */
+    ASSERT_EQ(pkt.data[3], TC_VERSION_V1, "v1 version byte incorrect");
+
+    /* Decode should succeed */
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "v1 decode failed");
+
+    /* Verify v2 is rejected */
+    uint8_t *tampered = (uint8_t *)malloc(pkt.size);
+    memcpy(tampered, pkt.data, pkt.size);
+    tampered[3] = 2;  /* version 2 — not supported */
+    err = tc_decoder_decode(dec, tampered, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_ERR_BITSTREAM, "v2 should be rejected");
+    free(tampered);
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: v1 profile and level signaling ──────────────────── */
+
+static void test_v1_profile_level(void)
+{
+    TEST(v1_profile_level_signaling);
+    int w = 64, h = 64;
+
+    /* Test baseline-mobile profile (0) */
+    {
+        tc_config_t cfg;
+        tc_config_defaults(&cfg, w, h);
+        cfg.qp = 32;
+        cfg.profile = TC_PROFILE_BASELINE_MOBILE;
+        cfg.level_idx = TC_LEVEL_1_1;
+
+        tc_encoder_t *enc = tc_encoder_create(&cfg);
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+        tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+        tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+        tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+        gen_gradient(y, w, h, w);
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "baseline-mobile encode failed");
+
+        /* profile_level byte = (profile << 4) | level_idx = (0 << 4) | 2 = 0x02 */
+        /* In v1 header: offset 8 is profile_level byte (after 3 magic + 1 version
+         * + 2 width + 2 height + 1 flags + 1 qp_delta + 1 frame_num = 12 bytes
+         * of v0 header, but v1 replaces the reserved byte at offset 11 with
+         * profile_level, and adds 2 bytes of tool_flags at offset 12-13).
+         * Actually: byte layout is sequential bits, so profile_level is
+         * at the bit position after frame_num. Let's check from the data. */
+        uint8_t profile_level = pkt.data[11];  /* After 3 magic + 1 ver + 2w + 2h + 1flags + 1qp + 1fn */
+        uint8_t got_profile = profile_level >> 4;
+        uint8_t got_level = profile_level & 0x0F;
+        ASSERT_EQ(got_profile, TC_PROFILE_BASELINE_MOBILE, "profile mismatch");
+        ASSERT_EQ(got_level, TC_LEVEL_1_1, "level mismatch");
+
+        /* Decode should succeed */
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "baseline-mobile decode failed");
+
+        tc_encoder_destroy(enc);
+        tc_decoder_destroy(dec);
+        free(y); free(cb); free(cr);
+    }
+
+    /* Test streaming-main profile (1) */
+    {
+        tc_config_t cfg;
+        tc_config_defaults(&cfg, w, h);
+        cfg.qp = 32;
+        cfg.profile = TC_PROFILE_STREAMING_MAIN;
+        cfg.level_idx = TC_LEVEL_3_0;
+
+        tc_encoder_t *enc = tc_encoder_create(&cfg);
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+        tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+        tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+        tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+        gen_gradient(y, w, h, w);
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "streaming-main encode failed");
+
+        uint8_t profile_level = pkt.data[11];
+        ASSERT_EQ(profile_level >> 4, TC_PROFILE_STREAMING_MAIN, "streaming profile mismatch");
+        ASSERT_EQ(profile_level & 0x0F, TC_LEVEL_3_0, "level 3.0 mismatch");
+
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "streaming-main decode failed");
+
+        tc_encoder_destroy(enc);
+        tc_decoder_destroy(dec);
+        free(y); free(cb); free(cr);
+    }
+
+    PASS();
+}
+
+/* ── Test: v1 tool flags ──────────────────────────────────── */
+
+static void test_v1_tool_flags(void)
+{
+    TEST(v1_tool_flags_in_bitstream);
+    int w = 64, h = 64;
+
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.profile = TC_PROFILE_BASELINE_MOBILE;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "encode failed");
+
+    /* tool_flags are at bytes 12-13 (after profile_level at byte 11) */
+    uint16_t tool_flags = (uint16_t)((pkt.data[12] << 8) | pkt.data[13]);
+
+    /* Baseline-mobile must always have these tools active: */
+    ASSERT_EQ((tool_flags & TC_TOOL_SKIP_MERGE) != 0, 1, "skip_merge must be set");
+    ASSERT_EQ((tool_flags & TC_TOOL_CFL_CHROMA) != 0, 1, "cfl_chroma must be set");
+    ASSERT_EQ((tool_flags & TC_TOOL_JND_WEIGHTING) != 0, 1, "jnd_weighting must be set");
+    ASSERT_EQ((tool_flags & TC_TOOL_MEDIAN_MV_PRED) != 0, 1, "median_mv_pred must be set");
+    /* 6-tap interp is always active in current encoder */
+    ASSERT_EQ((tool_flags & TC_TOOL_SIX_TAP_INTERP) != 0, 1, "six_tap_interp always active");
+    /* Multi-ref must NOT be set for baseline-mobile (profile compliance) */
+    ASSERT_EQ((tool_flags & TC_TOOL_MULTI_REF) != 0, 0, "multi_ref must NOT be set for baseline-mobile");
+
+    /* Decode should succeed */
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "decode failed");
+
+    printf(" [tool_flags=0x%04x]", tool_flags);
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: v1 all profiles roundtrip ─────────────────────── */
+
+static void test_v1_all_profiles(void)
+{
+    TEST(v1_all_profiles_roundtrip);
+    int w = 64, h = 64;
+
+    /* Test archive-high (2) and grain-cinema (3) roundtrip */
+    int profiles[] = { TC_PROFILE_ARCHIVE_HIGH, TC_PROFILE_GRAIN_CINEMA };
+    const char *names[] = { "archive-high", "grain-cinema" };
+
+    for (int p = 0; p < 2; p++) {
+        tc_config_t cfg;
+        tc_config_defaults(&cfg, w, h);
+        cfg.qp = 32;
+        cfg.profile = profiles[p];
+
+        tc_encoder_t *enc = tc_encoder_create(&cfg);
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+        ASSERT_NE(enc, NULL, "encoder NULL");
+        ASSERT_NE(dec, NULL, "decoder NULL");
+
+        tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+        tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+        tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+        gen_gradient(y, w, h, w);
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "encode failed");
+
+        /* Verify profile_level byte */
+        uint8_t profile_level = pkt.data[11];
+        ASSERT_EQ(profile_level >> 4, profiles[p], "profile mismatch");
+
+        /* Decode should succeed */
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "decode failed");
+
+        double psnr = tc_psnr(y, w, dy, sy, w, h);
+        printf(" [%s PSNR=%.1fdB]", names[p], psnr);
+        ASSERT_RANGE(psnr, 15.0, 100.0, "PSNR out of range");
+
+        tc_encoder_destroy(enc);
+        tc_decoder_destroy(dec);
+        free(y); free(cb); free(cr);
+    }
+
+    PASS();
+}
+
+/* ── Test: v1 tool flags with streaming-main + SLOW preset ── */
+
+static void test_v1_tool_flags_streaming_slow(void)
+{
+    TEST(v1_tool_flags_streaming_main_slow);
+    int w = 64, h = 64;
+
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.profile = TC_PROFILE_STREAMING_MAIN;
+    cfg.preset = TC_PRESET_SLOW;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "encode failed");
+
+    /* tool_flags are at bytes 12-13 */
+    uint16_t tool_flags = (uint16_t)((pkt.data[12] << 8) | pkt.data[13]);
+
+    /* streaming-main + SLOW should have multi-ref set */
+    ASSERT_EQ((tool_flags & TC_TOOL_MULTI_REF) != 0, 1, "multi_ref must be set for streaming-main+SLOW");
+    /* All baseline tools too */
+    ASSERT_EQ((tool_flags & TC_TOOL_SKIP_MERGE) != 0, 1, "skip_merge must be set");
+    ASSERT_EQ((tool_flags & TC_TOOL_SIX_TAP_INTERP) != 0, 1, "six_tap must be set");
+
+    /* Decode should succeed */
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "decode failed");
+
+    printf(" [tool_flags=0x%04x]", tool_flags);
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: v1 RAP (Random Access Point) ─────────────────── */
+
+static void test_v1_rap(void)
+{
+    TEST(v1_random_access_point);
+    int w = 64, h = 64;
+
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.keyframe_interval = 5;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    /* Frame 0: keyframe — should have RAP flag set */
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt0;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt0);
+    ASSERT_EQ(err, TC_OK, "encode frame 0 failed");
+
+    /* v1 keyframe must have both KEY_FRAME and RAP flags */
+    uint8_t flags0 = pkt0.data[8];  /* flags byte offset */
+    ASSERT_EQ((flags0 & TC_FLAG_KEY_FRAME) != 0, 1, "frame 0 must be keyframe");
+    ASSERT_EQ((flags0 & TC_FLAG_RAP) != 0, 1, "keyframe must have RAP flag");
+
+    /* Frame 1: P-frame — should NOT have RAP flag */
+    tc_packet_t pkt1;
+    err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt1);
+    ASSERT_EQ(err, TC_OK, "encode frame 1 failed");
+
+    uint8_t flags1 = pkt1.data[8];
+    ASSERT_EQ((flags1 & TC_FLAG_KEY_FRAME) != 0, 0, "frame 1 must not be keyframe");
+    ASSERT_EQ((flags1 & TC_FLAG_RAP) != 0, 0, "P-frame must not have RAP flag");
+
+    /* Decode both */
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt0.data, pkt0.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "decode frame 0 failed");
+    err = tc_decoder_decode(dec, pkt1.data, pkt1.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "decode frame 1 failed");
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: v1 CRC-16 validation ─────────────────────────── */
+
+static void test_v1_crc(void)
+{
+    TEST(v1_crc16_validation);
+    int w = 64, h = 64;
+
+    /* Encode with CRC enabled */
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.enable_crc = 1;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "CRC encode failed");
+
+    /* Verify CRC flag is set in header */
+    uint8_t flags = pkt.data[8];
+    ASSERT_EQ((flags & TC_FLAG_CRC) != 0, 1, "CRC flag must be set");
+
+    /* Decode with valid CRC — should report CRC valid */
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "CRC decode failed");
+    ASSERT_EQ(tc_decoder_crc_valid(dec), 1, "CRC should be valid");
+
+    /* Tamper with data and verify CRC check fails */
+    uint8_t *tampered = (uint8_t *)malloc(pkt.size);
+    memcpy(tampered, pkt.data, pkt.size);
+    /* Corrupt a byte in the CTU data area (after header) */
+    tampered[16] ^= 0xFF;
+
+    tc_decoder_t *dec2 = tc_decoder_create(0, 0);
+    err = tc_decoder_decode(dec2, tampered, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    /* Decoder may still return OK (graceful degradation), but CRC should fail */
+    ASSERT_EQ(tc_decoder_crc_valid(dec2), 0, "CRC should detect corruption");
+
+    free(tampered);
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    tc_decoder_destroy(dec2);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: v0 backward compatibility ─────────────────────── */
+
+static void test_v0_backward_compat(void)
+{
+    TEST(v0_backward_compatibility);
+    int w = 64, h = 64;
+
+    /* Encode with v0 (legacy) bitstream version */
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.bitstream_version = TC_VERSION_V0;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "v0 encode failed");
+
+    /* Verify version byte is 0 */
+    ASSERT_EQ(pkt.data[3], TC_VERSION_V0, "v0 version byte incorrect");
+
+    /* Verify v0 header is exactly 12 bytes (no profile_level or tool_flags) */
+    /* The reserved byte at offset 11 should be 0 */
+    ASSERT_EQ(pkt.data[11], 0, "v0 reserved byte must be 0");
+
+    /* Decode should succeed */
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "v0 decode failed");
+
+    /* v0 has no CRC, so crc_valid should return 1 (default) */
+    ASSERT_EQ(tc_decoder_crc_valid(dec), 1, "v0 no CRC means default valid");
+
+    /* Encode same content with v1 to verify size invariant */
+    tc_config_t cfg_v1;
+    tc_config_defaults(&cfg_v1, w, h);
+    cfg_v1.qp = 32;
+    cfg_v1.bitstream_version = TC_VERSION_V1;  /* default, but explicit */
+
+    tc_encoder_t *enc_v1 = tc_encoder_create(&cfg_v1);
+    tc_pixel_t *y2  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb2 = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr2 = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y2, w, h, w);
+    memset(cb2, 128, (size_t)(w/2 * h/2));
+    memset(cr2, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt_v1;
+    tc_encoder_encode(enc_v1, y2, w, cb2, w/2, cr2, w/2, &pkt_v1);
+
+    /* v1 header is exactly 2 bytes longer than v0 (14 vs 12 bytes).
+     * CTU data should be identical for same content/QP, so the
+     * only size difference should be the 2-byte header extension. */
+    int size_diff = (int)pkt_v1.size - (int)pkt.size;
+    ASSERT_EQ(size_diff, 2, "v1 should be exactly 2 bytes longer than v0");
+    printf(" [v0=%zuB v1=%zuB diff=%dB]", pkt.size, pkt_v1.size, size_diff);
+
+    double psnr_v0 = tc_psnr(y, w, dy, sy, w, h);
+    printf(" [v0 PSNR=%.1fdB]", psnr_v0);
+    ASSERT_RANGE(psnr_v0, 15.0, 100.0, "v0 PSNR out of range");
+
+    tc_encoder_destroy(enc);
+    tc_encoder_destroy(enc_v1);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    free(y2); free(cb2); free(cr2);
+    PASS();
+}
+
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1644,6 +2139,16 @@ int main(void)
     test_version_check();
     test_fuzz_edge_cases();
     test_wpp_roundtrip();
+
+    /* Phase 2: v1 bitstream tests */
+    test_v1_bitstream_version();
+    test_v1_profile_level();
+    test_v1_tool_flags();
+    test_v1_all_profiles();
+    test_v1_tool_flags_streaming_slow();
+    test_v1_rap();
+    test_v1_crc();
+    test_v0_backward_compat();
 
     /* Summary */
     printf("\n════════════════════════════════════════════════════════\n");

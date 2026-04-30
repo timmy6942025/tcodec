@@ -6,10 +6,32 @@
  *  - Unsigned Exp-Golomb (ue)
  *  - Signed Exp-Golomb (se)
  *  - Byte alignment
+ *  - CRC-16 computation for v1 bitstream error detection
  */
 
 #include "tcodec_common.h"
 #include <assert.h>
+
+/* ── CRC-16 (CCITT) ──────────────────────────────────────────
+ * Polynomial: 0x1021 (x^16 + x^12 + x^5 + 1)
+ * Used for v1 bitstream error detection when TC_FLAG_CRC is set.
+ * Covers frame header + CTU data (NOT the CRC bytes themselves).
+ * ══════════════════════════════════════════════════════════════ */
+
+uint16_t tc_crc16(const uint8_t *data, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc = crc << 1;
+        }
+    }
+    return crc;
+}
 
 /* ── Writer ──────────────────────────────────────────────────── */
 
@@ -168,4 +190,28 @@ int32_t tc_bs_reader_read_se(tc_bs_reader_t *r)
 int tc_bs_reader_eof(tc_bs_reader_t *r)
 {
     return r->byte_pos >= r->size;
+}
+
+/* ── Level constraints table ─────────────────────────────────
+ * Maps level_idx → max resolution, DPB, bitrate.
+ * Index 0 = auto (no constraints). See PROFILES.md §4.
+ * ══════════════════════════════════════════════════════════════ */
+
+static const tc_level_info_t level_table[] = {
+    /*       max_w   max_h   max_dpb  max_bitrate */
+    {        4096,   4096,   8,       0          },  /* 0: auto */
+    {         320,    240,   1,       500000     },  /* 1: Level 1.0 */
+    {         640,    480,   2,       2000000    },  /* 2: Level 1.1 */
+    {        1280,    720,   2,       5000000    },  /* 3: Level 2.0 */
+    {        1280,    720,   4,       10000000   },  /* 4: Level 2.1 */
+    {        1920,   1080,   4,       20000000   },  /* 5: Level 3.0 */
+    {        1920,   1080,   4,       40000000   },  /* 6: Level 3.1 */
+    {        3840,   2160,   4,       80000000   },  /* 7: Level 4.0 */
+    {        3840,   2160,   8,       160000000  },  /* 8: Level 4.1 */
+};
+
+const tc_level_info_t *tc_level_get_info(int level_idx)
+{
+    if (level_idx < 0 || level_idx > TC_LEVEL_MAX) return &level_table[0];
+    return &level_table[level_idx];
 }

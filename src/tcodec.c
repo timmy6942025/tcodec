@@ -89,4 +89,9 @@ void tc_config_defaults(tc_config_t *cfg, int width, int height)
     cfg->threads     = 0;   /* Auto-detect */
     cfg->tile_cols   = 0;   /* Auto */
     cfg->tile_rows   = 0;   /* Auto */
+    /* v1 bitstream fields */
+    cfg->bitstream_version = TC_VERSION_V1;  /* Default: v1 */
+    cfg->profile    = TC_PROFILE_BASELINE_MOBILE;
+    cfg->level_idx  = TC_LEVEL_AUTO;         /* Auto */
+    cfg->enable_crc = 0;                     /* CRC off by default */
 }

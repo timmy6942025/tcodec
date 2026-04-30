@@ -1,7 +1,7 @@
-# TCodec Bitstream Syntax — Version 0
+# TCodec Bitstream Syntax — Version 0 and Version 1
 
-**Status**: Working prototype. Not yet frozen.  
-**Bitstream Version**: 0  
+**Status**: Working prototype. v0 and v1 supported.  
+**Bitstream Versions**: 0 (legacy), 1 (current)  
 **Magic**: `0x54 0x43 0x56` ("TCV")
 
 ---
@@ -35,7 +35,9 @@ Each frame packet contains:
 
 ```
 ┌──────────────────────┐
-│ Frame Header         │  12 bytes fixed
+│ Frame Header         │  12 bytes (v0) or 14 bytes (v1)
+├──────────────────────┤
+│ [WPP entry points]   │  Present when TC_FLAG_WPP is set
 ├──────────────────────┤
 │ CTU Row 0            │
 │   CTU (0,0) data     │
@@ -46,6 +48,8 @@ Each frame packet contains:
 │   ...                │
 ├──────────────────────┤
 │ ...                  │
+├──────────────────────┤
+│ [CRC-16]             │  2 bytes (v1 only, when TC_FLAG_CRC is set)
 └──────────────────────┘
 ```
 
@@ -55,39 +59,114 @@ moving to the next CTU.
 
 ---
 
-## 3. Frame Header (12 bytes = 96 bits)
+## 3. Frame Header
+
+### 3.1 Version 0 Header (12 bytes = 96 bits)
 
 | Bit Offset | Width | Field | Description |
 |-----------|-------|-------|-------------|
 | 0–7 | 8 | `magic[0]` | `0x54` ('T') |
 | 8–15 | 8 | `magic[1]` | `0x43` ('C') |
 | 16–23 | 8 | `magic[2]` | `0x56` ('V') |
-| 24–31 | 8 | `version` | `0x00` (current version) |
+| 24–31 | 8 | `version` | `0x00` (version 0) |
 | 32–47 | 16 | `width` | Frame width in pixels (1–4096) |
 | 48–63 | 16 | `height` | Frame height in pixels (1–4096) |
-| 64–71 | 8 | `flags` | Bitfield (see below) |
+| 64–71 | 8 | `flags` | Bitfield (see §3.3) |
 | 72–79 | 8 | `qp_delta` | Signed offset from default QP (32) |
 | 80–87 | 8 | `frame_num` | Frame counter, low 8 bits |
 | 88–95 | 8 | `reserved` | `0x00` (must be ignored by decoders) |
 
+### 3.2 Version 1 Header (14 bytes = 112 bits)
+
+| Bit Offset | Width | Field | Description |
+|-----------|-------|-------|-------------|
+| 0–7 | 8 | `magic[0]` | `0x54` ('T') |
+| 8–15 | 8 | `magic[1]` | `0x43` ('C') |
+| 16–23 | 8 | `magic[2]` | `0x56` ('V') |
+| 24–31 | 8 | `version` | `0x01` (version 1) |
+| 32–47 | 16 | `width` | Frame width in pixels (1–4096) |
+| 48–63 | 16 | `height` | Frame height in pixels (1–4096) |
+| 64–71 | 8 | `flags` | Bitfield (see §3.3, v1 adds RAP/CRC/EXT) |
+| 72–79 | 8 | `qp_delta` | Signed offset from default QP (32) |
+| 80–87 | 8 | `frame_num` | Frame counter, low 8 bits |
+| 88–95 | 8 | `profile_level` | `(profile << 4) \| level_idx` |
+| 96–111 | 16 | `tool_flags` | Which coding tools are active (see §3.4) |
+
 After the header, the bitstream is **byte-aligned** (padding bits to the
 next byte boundary).
 
-### 3.1 Flags Byte
+### 3.3 Flags Byte
 
-| Bit | Mask | Field | Description |
-|-----|------|-------|-------------|
-| 7 | `0x80` | `key_frame` | 1 = I-frame (intra-only), 0 = P-frame |
-| 6 | `0x40` | `wpp` | 1 = WPP row entry points present |
-| 3–5 | — | `reserved` | Must be 0 |
-| 2–3 | `0x0C` | `tile_cols_log2` | log2 of tile columns (0 = 1 col) |
-| 0–1 | `0x03` | `tile_rows_log2` | log2 of tile rows (0 = 1 row) |
+| Bit | Mask | Field | v0 | v1 | Description |
+|-----|------|-------|----|----|-------------|
+| 7 | `0x80` | `key_frame` | ✅ | ✅ | 1 = I-frame (intra-only), 0 = P-frame |
+| 6 | `0x40` | `wpp` | ✅ | ✅ | 1 = WPP row entry points present |
+| 5 | `0x20` | `rap` | — | ✅ | 1 = Random Access Point (independent decode) |
+| 4 | `0x10` | `crc` | — | ✅ | 1 = CRC-16 appended after CTU data |
+| 3 | `0x08` | `ext_header` | — | ✅ | 1 = extension header sections follow |
+| 2–3 | `0x0C` | `tile_cols_log2` | ✅ | ✅ | log2 of tile columns (0 = 1 col) |
+| 0–1 | `0x03` | `tile_rows_log2` | ✅ | ✅ | log2 of tile rows (0 = 1 row) |
+
+**NOTE**: v0 bits 5–3 are reserved (must be 0). v1 uses them for
+RAP, CRC, and ext_header. This is backward-compatible because a v0
+decoder never reads these bits, and a v1 decoder knows the version.
 
 **NOTE**: Tile fields are coded but **not actually used** by the
 encoder or decoder. The entire frame is processed as a single tile.
 These bits are reserved for future tile-based parallelism.
 
-### 3.2 Derived Fields
+### 3.4 Tool Flags (16 bits, v1 only)
+
+| Bit | Mask | Field | Profile Required | Description |
+|-----|------|-------|-----------------|-------------|
+| 0 | `0x0001` | `skip_merge` | baseline-mobile | Skip/merge inter modes |
+| 1 | `0x0002` | `cfl_chroma` | baseline-mobile | Chroma-from-luma prediction |
+| 2 | `0x0004` | `jnd_weighting` | baseline-mobile | JND band quantization weighting |
+| 3 | `0x0008` | `median_mv_pred` | baseline-mobile | Median MV predictor + MVD coding |
+| 4 | `0x0010` | `multi_ref` | streaming-main | Multiple reference frames |
+| 5 | `0x0020` | `six_tap_interp` | streaming-main | 6-tap luma interpolation filter |
+| 6 | `0x0040` | `entropy_coded` | streaming-main | Context-modeled entropy (future) |
+| 7 | `0x0080` | `dering` | streaming-main | Directional deringing (future) |
+| 8 | `0x0100` | `sao` | streaming-main | Sample Adaptive Offset (future) |
+| 9 | `0x0200` | `grain_synthesis` | grain-cinema | Film grain synthesis (future) |
+| 10 | `0x0400` | `bipred` | archive-high | Bi-prediction (future) |
+| 11 | `0x0800` | `loop_restoration` | archive-high | Wiener-like restoration (future) |
+| 12 | `0x1000` | `affine_motion` | archive-high | Affine motion model (future) |
+| 13 | `0x2000` | `extended_part` | archive-high | Extended partition types (future) |
+| 14 | `0x4000` | `context_reset` | — | Context model reset point (future) |
+| 15 | — | *reserved* | — | Must be 0 |
+
+A decoder for profile N silently ignores tools that are not in its
+profile (it must not encounter them if the encoder is compliant).
+
+### 3.5 Profile/Level Byte
+
+The `profile_level` byte packs profile and level into one byte:
+
+```
+profile_level = (profile << 4) | (level_idx & 0x0F)
+```
+
+| Profile | Value | Name |
+|---------|-------|------|
+| 0 | `baseline-mobile` | Low-power ARM decoder |
+| 1 | `streaming-main` | Primary streaming profile |
+| 2 | `archive-high` | Offline / studio quality |
+| 3 | `grain-cinema` | Film grain synthesis required |
+
+| Level | Idx | Max Width | Max Height | Max DPB | Max Bitrate |
+|-------|-----|-----------|------------|---------|-------------|
+| Auto | 0 | — | — | — | — |
+| 1.0 | 1 | 320 | 240 | 1 | 500 kbps |
+| 1.1 | 2 | 640 | 480 | 2 | 2 Mbps |
+| 2.0 | 3 | 1280 | 720 | 2 | 5 Mbps |
+| 2.1 | 4 | 1280 | 720 | 4 | 10 Mbps |
+| 3.0 | 5 | 1920 | 1080 | 4 | 20 Mbps |
+| 3.1 | 6 | 1920 | 1080 | 4 | 40 Mbps |
+| 4.0 | 7 | 3840 | 2160 | 4 | 80 Mbps |
+| 4.1 | 8 | 3840 | 2160 | 8 | 160 Mbps |
+
+### 3.6 Derived Fields
 
 Decoders derive these from the header:
 
@@ -98,6 +177,21 @@ Decoders derive these from the header:
     so values > 127 represent negative deltas (QP < 32)
 - `tile_cols` = `1 << tile_cols_log2`
 - `tile_rows` = `1 << tile_rows_log2`
+- `is_rap` = `(flags & TC_FLAG_RAP) != 0` (v1 only)
+- `has_crc` = `(flags & TC_FLAG_CRC) != 0` (v1 only)
+- `profile` = `(profile_level >> 4) & 0x0F` (v1 only, defaults to 0 for v0)
+- `level_idx` = `profile_level & 0x0F` (v1 only, defaults to 0 for v0)
+
+### 3.7 CRC-16 (v1 only)
+
+When `TC_FLAG_CRC` is set, a CRC-16 (CCITT, polynomial 0x1021) is
+appended after the CTU data. The CRC covers all bytes from the start
+of the frame data up to (but not including) the CRC itself.
+
+- **Encoder**: Computes CRC over header + CTU data, appends 2 bytes (big-endian)
+- **Decoder**: Validates CRC before decoding. On mismatch, sets
+  `last_crc_valid = 0` but still decodes the frame (graceful degradation).
+  Caller can check via `tc_decoder_crc_valid()`.
 
 ---
 
@@ -365,9 +459,11 @@ Position index → raster index mapping:
 
 ## 7. Complete Bitstream Syntax (Pseudo-code)
 
+### 7.1 v0 Bitstream
+
 ```
-frame_packet() {
-    // Header
+frame_packet_v0() {
+    // Header (12 bytes)
     magic[0]       = u(8)    // 0x54
     magic[1]       = u(8)    // 0x43
     magic[2]       = u(8)    // 0x56
@@ -377,7 +473,7 @@ frame_packet() {
     flags          = u(8)
     qp_delta       = u(8)
     frame_num      = u(8)
-    reserved       = u(8)
+    reserved       = u(8)    // 0x00
     byte_align()
 
     // Derived
@@ -385,6 +481,64 @@ frame_packet() {
     qp = clip(32 + qp_delta, 0, 63)
 
     // CTU data
+    ctu_data_all()
+}
+```
+
+### 7.2 v1 Bitstream
+
+```
+frame_packet_v1() {
+    // Header (14 bytes)
+    magic[0]       = u(8)    // 0x54
+    magic[1]       = u(8)    // 0x43
+    magic[2]       = u(8)    // 0x56
+    version        = u(8)    // 1
+    width          = u(16)
+    height         = u(16)
+    flags          = u(8)    // Includes RAP, CRC, EXT bits
+    qp_delta       = u(8)
+    frame_num      = u(8)
+    profile_level  = u(8)    // (profile << 4) | level_idx
+    tool_flags     = u(16)   // Active coding tools
+    byte_align()
+
+    // Derived
+    is_key = (flags >> 7) & 1
+    is_rap = (flags >> 5) & 1
+    has_crc = (flags >> 4) & 1
+    has_ext = (flags >> 3) & 1
+    profile = profile_level >> 4
+    level_idx = profile_level & 0x0F
+    qp = clip(32 + qp_delta, 0, 63)
+
+    // Extension header sections (if has_ext)
+    while (has_ext) {
+        ext_type = u(8)
+        if (ext_type == 0) break   // TC_EXT_END
+        ext_size = u(16)
+        ext_payload(ext_size)
+    }
+
+    // WPP entry points (if flags.wpp)
+    if (flags & 0x40) {
+        wpp_entry_points()
+    }
+
+    // CTU data
+    ctu_data_all()
+
+    // CRC-16 (if has_crc)
+    if (has_crc) {
+        crc16 = u(16)   // Big-endian, covers header + CTU data
+    }
+}
+```
+
+### 7.3 CTU Data (common to v0 and v1)
+
+```
+ctu_data_all() {
     for (row = 0; row < num_ctu_rows; row++) {
         for (col = 0; col < num_ctu_cols; col++) {
             ctu_data(row, col)
@@ -457,74 +611,97 @@ coeff_block(n) {
 
 ## 8. Bitstream Compliance
 
-### 8.1 Decoder Error Handling
+### 8.1 Version Handling
+
+| Version | Behavior |
+|---------|----------|
+| 0 | Accepted by all decoders (12-byte header) |
+| 1 | Accepted by v1-aware decoders (14-byte header) |
+| 2+ | Rejected with `TC_ERR_BITSTREAM` |
+
+### 8.2 Decoder Error Handling
 
 Current decoder behavior on malformed bitstreams:
 
 | Condition | Behavior |
 |-----------|----------|
 | Invalid magic | Return `TC_ERR_BITSTREAM` |
-| Invalid version | Accepted (not checked beyond reading) |
+| Invalid version (>1) | Return `TC_ERR_BITSTREAM` |
+| Unknown profile (>3) | Return `TC_ERR_BITSTREAM` |
+| Level constraint exceeded | Return `TC_ERR_BITSTREAM` |
 | EOF mid-header | Return `TC_ERR_EOF` |
 | Invalid intra mode (≥18) | Clamp to DC (mode 1) |
 | `last_nz_plus1 > n` | Clamp to `n - 1` |
 | Out-of-bounds MV | Fallback to DC(128) prediction — safe degradation |
 | Invalid ref_idx (≥4) | Clamp to 0 |
+| CRC mismatch | Set `last_crc_valid = 0`, continue decoding (graceful) |
 | Truncated coefficient data | Reads past buffer — **no safety check** |
 
-### 8.2 Known Bitstream Deficiencies
+### 8.3 Known Bitstream Deficiencies
 
-1. **No version negotiation**: Decoder cannot reject unknown versions
-2. **No CRC or checksum**: Corruption is undetectable except by magic
-3. **No random access points**: Must decode from first frame
+1. ~~No version negotiation~~ ✅ v1: versions >1 are rejected
+2. ~~No CRC or checksum~~ ✅ v1: CRC-16 (CCITT) when TC_FLAG_CRC set
+3. ~~No random access points~~ ✅ v1: TC_FLAG_RAP marks independent frames
 4. **No error resilience**: A single bit error corrupts all subsequent data
-5. **Fixed header size**: No extension mechanism for new fields
+5. ~~Fixed header size~~ ✅ v1: ext_header flag allows future extensions
 6. **WPP entry points**: When TC_FLAG_WPP is set, an entry point table follows the header
 7. **Reference frame signaling**: 4 DPB slots, ref_idx coded per block (2 bits)
-8. **No bit-rate signaling**: Target bitrate not stored in bitstream
+8. ~~No bit-rate signaling~~ v1: level constraints imply max bitrate
 9. **NEON/scalar output divergence**: NEON deblock uses different filter strength than scalar
 10. **WPP/sequential bitstream divergence**: WPP bitstreams byte-align per row (sequential do not)
+11. **Tool flags informational only**: Decoder does not yet skip syntax based on tool flags
+12. **Extension header not yet emitted**: TC_FLAG_EXT_HEADER is defined but encoder doesn't write extensions
 
 ---
 
-## 9. Encoding Example
+## 9. Encoding Examples
 
-For a 128×128 frame at QP 32, P-frame:
+### 9.1 v0 Frame (128×128, QP 32, P-frame)
 
 ```
 Header (12 bytes):
-  54 43 56 00   // Magic + version
+  54 43 56 00   // Magic + version=0
   00 80 00 80   // Width=128, Height=128
   00 00 00 00   // flags=0 (P-frame), qp_delta=0 (QP=32), frame_num=0, reserved=0
 
-CTU 0,0 (64×64 = 64 blocks):
-  Block (0,0): dct_flag=0, is_intra=1, mode=1(DC), coeffs...
-  Block (1,0): dct_flag=0, is_intra=0, mvd_x=0, mvd_y=-4, coeffs...
-  Block (2,0): dct_flag=1, is_intra=1, mode=5(vertical), 4×sub-blocks...
-  ...
+CTU data...
+```
 
-CTU 1,0 (64×64):
-  ...
+### 9.2 v1 Frame (128×128, QP 32, I-frame, baseline-mobile, Level 1.1, CRC)
 
-CTU 0,1 (64×64):
-  ...
+```
+Header (14 bytes):
+  54 43 56 01   // Magic + version=1
+  00 80 00 80   // Width=128, Height=128
+  B0 00 00 02   // flags=0xB0 (key+RAP+CRC), qp_delta=0, frame_num=0,
+                // profile_level=0x02 (baseline-mobile, Level 1.1)
+  00 3F         // tool_flags=0x003F (skip_merge+cfl+jnd+median_mv+six_tap)
 
-(4 CTUs total for 128×128 frame)
+CTU data...
+
+CRC-16 (2 bytes):
+  XX XX         // CRC-16 CCITT over header + CTU data
 ```
 
 ---
 
-## 10. Future Bitstream Changes (Not Yet Implemented)
+## 10. Version Migration Guide
 
-The following changes are needed per the Master Plan:
+### 10.1 Upgrading from v0 to v1
 
-- **Versioned syntax**: Allow decoders to reject unknown versions
-- **Profile/level signaling**: Indicate supported tool subset
-- **Tool flags**: Bitfield indicating which optional tools are active
-- **Random access points**: Mark frames that can be decoded independently
-- **CRC/checksum**: Detect bitstream corruption
-- **Tile boundaries**: Explicit tile start/end markers
-- **Multiple reference signaling**: Which DPB slots to use
-- **Extended header**: Variable-length header with optional sections
-- **Bitrate/target metadata**: Store encoding parameters
-- **Packetization**: Framing for network transport
+- v0 bitstreams are always decodable by v1-aware decoders
+- v1 bitstreams are **not** decodable by v0-only decoders (version byte differs)
+- The v1 header extends the v0 `reserved` byte into `profile_level`,
+  and adds 2 bytes of `tool_flags` after it
+- Set `cfg.bitstream_version = TC_VERSION_V1` to encode v1 (default)
+- Set `cfg.bitstream_version = TC_VERSION_V0` for legacy compatibility
+
+### 10.2 Adding Future v2 Features
+
+When a new bitstream version is needed:
+1. Increment `TC_VERSION_V2` constant
+2. Add new header fields after tool_flags (or use ext_header)
+3. Update decoder's version dispatch in `read_frame_header()`
+4. Update `TC_FRAME_HEADER_SIZE_V2` constant
+5. Add v2-specific tests
+6. Update this document

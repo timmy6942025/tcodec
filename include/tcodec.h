@@ -74,6 +74,11 @@ tc_error_t tc_decoder_decode(tc_decoder_t *dec,
 void tc_decoder_get_info(tc_decoder_t *dec,
                           int32_t *width, int32_t *height);
 
+/* Get CRC validation result from last decoded frame.
+ * Returns 1 if CRC was OK or no CRC was present, 0 if CRC mismatch.
+ * Only meaningful for v1 bitstreams with TC_FLAG_CRC set. */
+int tc_decoder_crc_valid(tc_decoder_t *dec);
+
 /* ── Utility functions ───────────────────────────────────────── */
 
 /* Get human-readable error string. */
