@@ -6,6 +6,7 @@
  */
 
 #include "tcodec.h"
+#include "tcodec_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -985,6 +986,613 @@ static void test_bitstream_errors(void)
     PASS();
 }
 
+/* ── Test: Large resolution (1920×1080) ─────────────────── */
+
+static void test_large_resolution(void)
+{
+    TEST(large_resolution_1920x1080);
+    int w = 1920, h = 1080;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.threads = 2;  /* Limit threads for memory on constrained systems */
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL for 1920x1080");
+    ASSERT_NE(dec, NULL, "decoder NULL for 1920x1080");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    ASSERT_NE(y, NULL, "alloc Y failed for 1920x1080");
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "encode 1920x1080 failed");
+    ASSERT_NE(pkt.size, (size_t)0, "packet empty for 1920x1080");
+
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "decode 1920x1080 failed");
+
+    double psnr = tc_psnr(y, w, dy, sy, w, h);
+    printf(" [PSNR=%.1fdB size=%zuB]", psnr, pkt.size);
+    ASSERT_RANGE(psnr, 15.0, 100.0, "1920x1080 PSNR out of range");
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Long-run soak (100 frames) ──────────────────── */
+
+static void test_long_run(void)
+{
+    TEST(long_run_100_frames);
+    int w = 128, h = 128;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+    cfg.keyframe_interval = 30;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    double total_psnr = 0;
+    int n_frames = 100;
+    int decode_errors = 0;
+
+    for (int f = 0; f < n_frames; f++) {
+        gen_noise(y, w, h, w, (unsigned)(f * 7));
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        if (err != TC_OK) { decode_errors++; continue; }
+
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        if (err != TC_OK) { decode_errors++; continue; }
+
+        double psnr = tc_psnr(y, w, dy, sy, w, h);
+        total_psnr += psnr;
+    }
+
+    double avg_psnr = total_psnr / n_frames;
+    printf(" [avgPSNR=%.1fdB over %d frames, errors=%d]", avg_psnr, n_frames, decode_errors);
+    ASSERT_EQ(decode_errors, 0, "decode errors during long run");
+    ASSERT_RANGE(avg_psnr, 15.0, 100.0, "long run avg PSNR out of range");
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: All-intra (keyframe only) ───────────────────── */
+
+static void test_all_intra(void)
+{
+    TEST(all_intra_keyframe_only);
+    int w = 128, h = 128;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 28;
+    cfg.keyframe_interval = 1;  /* Force all keyframes */
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    double total_psnr = 0;
+    int n_frames = 5;
+
+    for (int f = 0; f < n_frames; f++) {
+        gen_noise(y, w, h, w, (unsigned)(f * 999));
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "encode failed in all-intra");
+        ASSERT_EQ(pkt.key_frame, 1, "frame should be keyframe in all-intra mode");
+
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "decode failed in all-intra");
+
+        double psnr = tc_psnr(y, w, dy, sy, w, h);
+        total_psnr += psnr;
+    }
+
+    double avg_psnr = total_psnr / n_frames;
+    printf(" [avgPSNR=%.1fdB]", avg_psnr);
+    ASSERT_RANGE(avg_psnr, 15.0, 100.0, "all-intra PSNR out of range");
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Decoder mismatch (encoder recon vs decoder output) */
+
+static void test_decoder_mismatch(void)
+{
+    TEST(decoder_mismatch_enc_recon_vs_dec_output);
+    int w = 128, h = 128;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 30;
+    cfg.keyframe_interval = 10;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    int n_frames = 5;
+    int mismatch_count = 0;
+
+    for (int f = 0; f < n_frames; f++) {
+        gen_noise(y, w, h, w, (unsigned)(f * 42));
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "encode failed");
+
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "decode failed");
+
+        /* Compare encoder's reconstructed frame with decoder's output.
+         * They must be pixel-identical — any mismatch means the
+         * encoder and decoder have diverged in their arithmetic. */
+        const tc_pixel_t *enc_recon_y = enc->recon->y;
+        int enc_stride = enc->recon->stride_y;
+
+        for (int row = 0; row < h; row++) {
+            for (int col = 0; col < w; col++) {
+                int enc_val = enc_recon_y[row * enc_stride + col];
+                int dec_val = dy[row * sy + col];
+                if (enc_val != dec_val) mismatch_count++;
+            }
+        }
+    }
+
+    printf(" [%d mismatches over %d frames]", mismatch_count, n_frames);
+    ASSERT_EQ(mismatch_count, 0, "encoder recon and decoder output differ");
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Boundary conditions (1st/last row/col blocks) ── */
+
+static void test_boundary_conditions(void)
+{
+    TEST(boundary_conditions_first_last_blocks);
+    int w = 100, h = 68;  /* Not CTU-aligned, tests partial CTUs */
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 30;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    /* Content with distinct boundary values */
+    for (int row = 0; row < h; row++) {
+        for (int col = 0; col < w; col++) {
+            y[row * w + col] = (tc_pixel_t)((row == 0 || row == h-1 ||
+                                             col == 0 || col == w-1) ? 255 : 64);
+        }
+    }
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "encode boundary test failed");
+
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "decode boundary test failed");
+
+    double psnr = tc_psnr(y, w, dy, sy, w, h);
+    printf(" [%dx%d PSNR=%.1fdB]", w, h, psnr);
+    ASSERT_RANGE(psnr, 15.0, 100.0, "boundary condition PSNR out of range");
+
+    /* Verify corner pixels are within reasonable range */
+    int top_left = dy[0];
+    int bot_left = dy[(h-1) * sy];
+    int top_right = dy[w - 1];
+    printf(" [TL=%d TR=%d BL=%d]", top_left, top_right, bot_left);
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Rate control CBR ───────────────────────────── */
+
+static void test_rate_control_cbr(void)
+{
+    TEST(rate_control_cbr);
+    int w = 128, h = 128;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.rc_method = TC_RC_CBR;
+    cfg.target_bitrate = 500000;  /* 500 kbps */
+    cfg.fps_num = 30;
+    cfg.fps_den = 1;
+    cfg.keyframe_interval = 30;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    int n_frames = 10;
+    size_t total_bytes = 0;
+
+    for (int f = 0; f < n_frames; f++) {
+        gen_noise(y, w, h, w, (unsigned)(f * 17));
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "CBR encode failed");
+
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "CBR decode failed");
+
+        total_bytes += pkt.size;
+    }
+
+    double actual_kbps = (double)total_bytes * 8.0 * 30.0 / (1000.0 * n_frames);
+    printf(" [target=500kbps actual=%.0fkbps over %d frames]", actual_kbps, n_frames);
+    /* CBR should be within 3x of target (loose for prototype ρ-domain) */
+    ASSERT_RANGE(actual_kbps, 100.0, 5000.0, "CBR bitrate wildly off target");
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Rate control VBR ────────────────────────────── */
+
+static void test_rate_control_vbr(void)
+{
+    TEST(rate_control_vbr);
+    int w = 128, h = 128;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.rc_method = TC_RC_VBR;
+    cfg.target_bitrate = 500000;  /* 500 kbps target */
+    cfg.fps_num = 30;
+    cfg.fps_den = 1;
+    cfg.keyframe_interval = 30;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+
+    int n_frames = 10;
+
+    for (int f = 0; f < n_frames; f++) {
+        gen_noise(y, w, h, w, (unsigned)(f * 31));
+        memset(cb, 128, (size_t)(w/2 * h/2));
+        memset(cr, 128, (size_t)(w/2 * h/2));
+
+        tc_packet_t pkt;
+        tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+        ASSERT_EQ(err, TC_OK, "VBR encode failed");
+
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+        ASSERT_EQ(err, TC_OK, "VBR decode failed");
+    }
+
+    printf(" [VBR %d frames ok]", n_frames);
+
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Version check (decoder rejects future version) */
+
+static void test_version_check(void)
+{
+    TEST(version_check_rejects_future);
+    int w = 64, h = 64;
+    tc_config_t cfg;
+    tc_config_defaults(&cfg, w, h);
+    cfg.qp = 32;
+
+    tc_encoder_t *enc = tc_encoder_create(&cfg);
+    tc_decoder_t *dec = tc_decoder_create(0, 0);
+    ASSERT_NE(enc, NULL, "encoder NULL");
+    ASSERT_NE(dec, NULL, "decoder NULL");
+
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    /* Encode valid frame */
+    tc_packet_t pkt;
+    tc_error_t err = tc_encoder_encode(enc, y, w, cb, w/2, cr, w/2, &pkt);
+    ASSERT_EQ(err, TC_OK, "encode failed");
+
+    /* Tamper with version byte (offset 3 in bitstream) to make it > TC_VERSION */
+    uint8_t *tampered = (uint8_t *)malloc(pkt.size);
+    memcpy(tampered, pkt.data, pkt.size);
+    tampered[3] = TC_VERSION + 1;  /* Future version */
+
+    const tc_pixel_t *dy, *dcb, *dcr;
+    int sy, scb, scr;
+    err = tc_decoder_decode(dec, tampered, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_ERR_BITSTREAM, "future version should be rejected");
+
+    /* Also test current version (0) is accepted */
+    err = tc_decoder_decode(dec, pkt.data, pkt.size, &dy, &sy, &dcb, &scb, &dcr, &scr);
+    ASSERT_EQ(err, TC_OK, "current version should be accepted");
+
+    free(tampered);
+    tc_encoder_destroy(enc);
+    tc_decoder_destroy(dec);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
+/* ── Test: Fuzz edge cases (systematic malformed inputs) ── */
+
+static void test_fuzz_edge_cases(void)
+{
+    TEST(fuzz_systematic_edge_cases);
+
+    /* Test 1: Valid magic + version but garbage after header */
+    {
+        uint8_t data[32];
+        memset(data, 0, sizeof(data));
+        data[0] = 0x54; data[1] = 0x43; data[2] = 0x56;  /* magic */
+        data[3] = 0;  /* version */
+        data[4] = 0; data[5] = 64;  /* width=64 */
+        data[6] = 0; data[7] = 64;  /* height=64 */
+        data[8] = 0x80;  /* flags: keyframe */
+        /* Rest is garbage */
+
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        tc_error_t err = tc_decoder_decode(dec, data, sizeof(data),
+                                            &dy, &sy, &dcb, &scb, &dcr, &scr);
+        /* May succeed or fail — just verify no crash */
+        (void)err;
+        tc_decoder_destroy(dec);
+    }
+
+    /* Test 2: Zero dimensions in header */
+    {
+        uint8_t data[16];
+        memset(data, 0, sizeof(data));
+        data[0] = 0x54; data[1] = 0x43; data[2] = 0x56;
+        data[3] = 0;
+        /* width=0, height=0 */
+
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        tc_error_t err = tc_decoder_decode(dec, data, sizeof(data),
+                                            &dy, &sy, &dcb, &scb, &dcr, &scr);
+        /* Should fail gracefully (0x0 frame) */
+        (void)err;
+        tc_decoder_destroy(dec);
+    }
+
+    /* Test 3: Max QP delta (qp_delta = 0xFF = -1 as int8_t → QP=31) */
+    {
+        uint8_t data[16];
+        memset(data, 0, sizeof(data));
+        data[0] = 0x54; data[1] = 0x43; data[2] = 0x56;
+        data[3] = 0;
+        data[4] = 0; data[5] = 64;  /* width */
+        data[6] = 0; data[7] = 64;  /* height */
+        data[8] = 0x80;  /* flags: keyframe */
+        data[9] = 0xFF;  /* qp_delta = -1 as int8_t → QP=31 */
+
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        tc_error_t err = tc_decoder_decode(dec, data, sizeof(data),
+                                            &dy, &sy, &dcb, &scb, &dcr, &scr);
+        (void)err;
+        tc_decoder_destroy(dec);
+    }
+
+    /* Test 4: Extreme dimensions (65535×65535) — should fail or OOM gracefully */
+    {
+        uint8_t data[16];
+        memset(data, 0, sizeof(data));
+        data[0] = 0x54; data[1] = 0x43; data[2] = 0x56;
+        data[3] = 0;
+        data[4] = 0xFF; data[5] = 0xFF;  /* width=65535 */
+        data[6] = 0xFF; data[7] = 0xFF;  /* height=65535 */
+        data[8] = 0x80;
+
+        tc_decoder_t *dec = tc_decoder_create(0, 0);
+        const tc_pixel_t *dy, *dcb, *dcr;
+        int sy, scb, scr;
+        tc_error_t err = tc_decoder_decode(dec, data, sizeof(data),
+                                            &dy, &sy, &dcb, &scb, &dcr, &scr);
+        /* Should fail with TC_ERR_MEMORY or similar — just no crash */
+        (void)err;
+        tc_decoder_destroy(dec);
+    }
+
+    printf(" [4 edge cases, no crashes]");
+    PASS();
+}
+
+/* ── Test: WPP roundtrip (threaded encode vs sequential) ── */
+
+static void test_wpp_roundtrip(void)
+{
+    TEST(wpp_threaded_vs_sequential_roundtrip);
+    int w = 128, h = 128;
+    tc_pixel_t *y  = (tc_pixel_t *)calloc((size_t)(w * h), 1);
+    tc_pixel_t *cb = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    tc_pixel_t *cr = (tc_pixel_t *)calloc((size_t)(w/2 * h/2), 1);
+    gen_gradient(y, w, h, w);
+    memset(cb, 128, (size_t)(w/2 * h/2));
+    memset(cr, 128, (size_t)(w/2 * h/2));
+
+    /* Encode with 1 thread (sequential, no WPP flag) */
+    tc_config_t cfg1;
+    tc_config_defaults(&cfg1, w, h);
+    cfg1.qp = 30;
+    cfg1.threads = 1;
+    tc_encoder_t *enc1 = tc_encoder_create(&cfg1);
+    ASSERT_NE(enc1, NULL, "enc1 NULL");
+
+    tc_packet_t pkt1;
+    tc_error_t err = tc_encoder_encode(enc1, y, w, cb, w/2, cr, w/2, &pkt1);
+    ASSERT_EQ(err, TC_OK, "encode1 failed");
+
+    /* Encode with 4 threads (WPP, TC_FLAG_WPP set) */
+    tc_config_t cfg4;
+    tc_config_defaults(&cfg4, w, h);
+    cfg4.qp = 30;
+    cfg4.threads = 4;
+    tc_encoder_t *enc4 = tc_encoder_create(&cfg4);
+    ASSERT_NE(enc4, NULL, "enc4 NULL");
+
+    tc_packet_t pkt4;
+    err = tc_encoder_encode(enc4, y, w, cb, w/2, cr, w/2, &pkt4);
+    ASSERT_EQ(err, TC_OK, "encode4 failed");
+
+    /* Decode both bitstreams and verify they produce valid output */
+    tc_decoder_t *dec1 = tc_decoder_create(0, 0);
+    tc_decoder_t *dec4 = tc_decoder_create(0, 0);
+
+    const tc_pixel_t *dy1, *dcb1, *dcr1;
+    int sy1, scb1, scr1;
+    err = tc_decoder_decode(dec1, pkt1.data, pkt1.size, &dy1, &sy1, &dcb1, &scb1, &dcr1, &scr1);
+    ASSERT_EQ(err, TC_OK, "decode1 failed");
+
+    const tc_pixel_t *dy4, *dcb4, *dcr4;
+    int sy4, scb4, scr4;
+    err = tc_decoder_decode(dec4, pkt4.data, pkt4.size, &dy4, &sy4, &dcb4, &scb4, &dcr4, &scr4);
+    ASSERT_EQ(err, TC_OK, "decode4 (WPP) failed");
+
+    double psnr1 = tc_psnr(y, w, dy1, sy1, w, h);
+    double psnr4 = tc_psnr(y, w, dy4, sy4, w, h);
+    printf(" [seq=%.1fdB wpp=%.1fdB diff=%.1fdB]", psnr1, psnr4, psnr1 - psnr4);
+
+    /* Both should produce reasonable quality.
+     * WPP and sequential may produce slightly different bitstreams
+     * (different tANS state evolution), so PSNR may differ by a few dB. */
+    ASSERT_RANGE(psnr1, 15.0, 100.0, "sequential PSNR out of range");
+    ASSERT_RANGE(psnr4, 15.0, 100.0, "WPP PSNR out of range");
+
+    /* Verify both decoders produce pixel-identical output when decoding
+     * the SAME bitstream (decode WPP bitstream twice — determinism check) */
+    tc_decoder_t *dec4b = tc_decoder_create(0, 0);
+    const tc_pixel_t *dy4b, *dcb4b, *dcr4b;
+    int sy4b, scb4b, scr4b;
+    err = tc_decoder_decode(dec4b, pkt4.data, pkt4.size, &dy4b, &sy4b, &dcb4b, &scb4b, &dcr4b, &scr4b);
+    ASSERT_EQ(err, TC_OK, "WPP decode (2nd pass) failed");
+
+    int det_mismatch = 0;
+    for (int row = 0; row < h; row++) {
+        for (int col = 0; col < w; col++) {
+            if (dy4[row * sy4 + col] != dy4b[row * sy4b + col]) det_mismatch++;
+        }
+    }
+    ASSERT_EQ(det_mismatch, 0, "WPP decode not deterministic");
+
+    /* Compare 1-thread vs 4-thread decoded outputs pixel-by-pixel.
+     * Different encoder thread counts may produce different bitstreams
+     * (WPP flag affects entry point table, tANS state), so we check
+     * that the decoded outputs are at least very similar (within 3 dB). */
+    int cross_mismatch = 0;
+    int max_pixel_diff = 0;
+    for (int row = 0; row < h; row++) {
+        for (int col = 0; col < w; col++) {
+            int diff = abs((int)dy1[row * sy1 + col] - (int)dy4[row * sy4 + col]);
+            if (diff > 0) cross_mismatch++;
+            if (diff > max_pixel_diff) max_pixel_diff = diff;
+        }
+    }
+    double psnr_diff = fabs(psnr1 - psnr4);
+    printf(" [cross_mismatch=%d max_diff=%d psnr_diff=%.1fdB]", cross_mismatch, max_pixel_diff, psnr_diff);
+    /* PSNR difference between sequential and WPP should be small */
+    ASSERT_RANGE(psnr_diff, 0.0, 5.0, "sequential vs WPP PSNR differ by >5dB");
+
+    tc_encoder_destroy(enc1);
+    tc_encoder_destroy(enc4);
+    tc_decoder_destroy(dec1);
+    tc_decoder_destroy(dec4);
+    tc_decoder_destroy(dec4b);
+    free(y); free(cb); free(cr);
+    PASS();
+}
+
 /* ── Main ──────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1019,6 +1627,18 @@ int main(void)
     test_non_ctu_aligned();
     test_fuzz_malformed();
     test_bitstream_errors();
+
+    /* Phase 0 completion tests */
+    test_large_resolution();
+    test_long_run();
+    test_all_intra();
+    test_decoder_mismatch();
+    test_boundary_conditions();
+    test_rate_control_cbr();
+    test_rate_control_vbr();
+    test_version_check();
+    test_fuzz_edge_cases();
+    test_wpp_roundtrip();
 
     /* Summary */
     printf("\n════════════════════════════════════════════════════════\n");

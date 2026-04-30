@@ -406,7 +406,7 @@ uses bilinear interpolation while the scalar version uses a proper
 
 ## 10. Implementation Status Summary
 
-### Working (Verified by Tests — 19 tests pass)
+### Working (Verified by Tests — 31 tests pass)
 
 - Encode/decode roundtrip for I-frames and P-frames
 - Intra prediction (18 modes, SAD mode decision)
@@ -436,8 +436,6 @@ uses bilinear interpolation while the scalar version uses a proper
 
 ### Not Implemented
 
-- Golden corpus of encoded samples and decoded outputs with hash manifest
-  (Phase 0 deliverable — see `golden/` directory, to be created)
 - Context modeling for entropy coding (contexts allocated, no modeling logic)
 - Deringing / SAO / loop restoration
 - Film grain synthesis
@@ -449,3 +447,149 @@ uses bilinear interpolation while the scalar version uses a proper
 - Bi-prediction / B-frames
 - Quadtree partitioning
 - More intra mode RDO (rate-distortion optimized mode decision)
+
+---
+
+## Appendix A: Architecture Diagrams
+
+### A.1 Encoder Pipeline
+
+```
+                        ┌─────────────────────────────────────────────────┐
+                        │              ENCODER PIPELINE                   │
+                        └─────────────────────────────────────────────────┘
+
+  Input YCbCr 4:2:0          ┌──────────┐         ┌──────────────┐
+  ──────────────────────────►│  Color    │────────►│  Rate        │
+  (Y, Cb, Cr planes)        │  Convert  │         │  Control     │
+                             │ (if RGB)  │         │ (QP select)  │
+                             └──────────┘         └──────┬───────┘
+                                                        │ QP
+                      ┌─────────────────────────────────┘
+                      │
+                      ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                     PER-CTU ROW (WPP parallel)                       │
+  │  ┌─────────┐   ┌──────────┐   ┌─────────┐   ┌──────────┐            │
+  │  │ Intra   │──►│ Forward  │──►│ Quantize│──►│ tANS     │            │
+  │  │ Predict │   │ WHT      │   │ + JND  │   │ Encode   │──► Row BS  │
+  │  │ (18 md) │   │ (4×4/8×8)│   │         │   │          │            │
+  │  └─────────┘   └──────────┘   └─────────┘   └──────────┘            │
+  │       │                                        ▲                     │
+  │       │ (inter blocks)                        │ (mode/MV/coeffs)   │
+  │       ▼                                        │                     │
+  │  ┌─────────┐   ┌──────────┐                   │                     │
+  │  │ Motion  │──►│ Residual │───────────────────┘                     │
+  │  │ Est      │   │ = orig-  │                                         │
+  │  │ (hex srch)│  │  pred   │                                         │
+  │  └─────────┘   └──────────┘                                         │
+  │                                                                      │
+  │  ┌─────────┐   ┌──────────┐   ┌─────────┐                           │
+  │  │ Inv     │──►│ Reconstruct│──►│ Deblock │──► Recon Frame          │
+  │  │ Quant   │   │ = pred+  │   │ Filter  │                           │
+  │  │         │   │  resid   │   │         │                           │
+  │  └─────────┘   └──────────┘   └─────────┘                           │
+  └──────────────────────────────────────────────────────────────────────┘
+                      │
+                      ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  Row BS merge: byte-align each row, prepend entry point table,      │
+  │  set TC_FLAG_WPP in header. Sequential: single BS, no table.       │
+  └──────────────────────────────────────────────────────────────────────┘
+                      │
+                      ▼
+               Encoded Bitstream (.tcv)
+```
+
+### A.2 Decoder Pipeline
+
+```
+                        ┌─────────────────────────────────────────────────┐
+                        │              DECODER PIPELINE                   │
+                        └─────────────────────────────────────────────────┘
+
+  Encoded Bitstream         ┌──────────────┐
+  ──────────────────────────►│  Frame       │
+  (.tcv)                    │  Header      │
+                            │  Parse       │
+                            └──────┬───────┘
+                                   │
+                            ┌──────┴───────┐
+                            │ WPP Entry    │
+                            │ Point Table  │ (if TC_FLAG_WPP)
+                            │ Parse        │
+                            └──────┬───────┘
+                                   │
+                      ┌────────────┴───────────────────────────────────┐
+                      │         PER-CTU ROW (WPP parallel)            │
+                      │                                               │
+                      │  ┌──────────┐   ┌─────────┐                  │
+                      │  │ tANS     │──►│ Inv     │                  │
+                      │  │ Decode   │   │ Quant   │                  │
+                      │  │ (coeffs) │   │ + JND   │                  │
+                      │  └──────────┘   └────┬────┘                  │
+                      │                       │                       │
+                      │  ┌──────────┐        │   ┌──────────┐       │
+                      │  │ Intra    │        │   │ Inv      │       │
+                      │  │ Predict  │        └──►│ WHT      │       │
+                      │  │ (18 md)  │            │ (4×4/8×8)│       │
+                      │  └────┬─────┘            └────┬─────┘       │
+                      │       │                       │              │
+                      │       │ (inter blocks)        │              │
+                      │  ┌────┴─────┐                │              │
+                      │  │ Inter    │                │              │
+                      │  │ Predict  │                │              │
+                      │  │ (6-tap)  │                │              │
+                      │  └────┬─────┘                │              │
+                      │       │ pred                  │ residual     │
+                      │       ▼                       ▼              │
+                      │  ┌──────────────────────────────────┐       │
+                      │  │ Reconstruct = pred + residual    │       │
+                      │  └──────────────┬───────────────────┘       │
+                      │                 │                           │
+                      │  ┌──────────────┴───────────────┐           │
+                      │  │ Deblock Filter               │──► Recon  │
+                      │  └──────────────────────────────┘           │
+                      └─────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                          Decoded YCbCr 4:2:0
+                          (Y, Cb, Cr planes)
+```
+
+### A.3 Bitstream Structure
+
+```
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  FRAME HEADER (12 bytes, byte-aligned)                         │
+  │  ┌───────┬───────┬───────┬───────┬──────┬──────┬──────┬──────┐  │
+  │  │ Magic │ Magic │ Magic │ Vers  │ Width│ Height│Flags │ QPΔ  │  │
+  │  │ 0x54  │ 0x43  │ 0x56  │ =0    │ 16b  │ 16b  │ 8b   │ 8b   │  │
+  │  └───────┴───────┴───────┴───────┴──────┴──────┴──────┴──────┘  │
+  │  ┌──────┬──────┐                                             │
+  │  │ Frm# │ Rsvd │  Flags: key(1) wpp(1) tile_c(2) tile_r(2)  │
+  │  │ 8b   │ 8b   │                                         │
+  │  └──────┴──────┘                                             │
+  └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼ (if TC_FLAG_WPP)
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  WPP ENTRY POINT TABLE                                         │
+  │  ┌──────────────────┐  ┌──────────────────┐                     │
+  │  │ num_rows (16b EG) │  │ offset[0] (EG)   │                     │
+  │  └──────────────────┘  ├──────────────────┤                     │
+  │                         │ offset[1] (EG)   │                     │
+  │                         ├──────────────────┤                     │
+  │                         │ ...              │                     │
+  │                         └──────────────────┘                     │
+  └─────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ROW DATA (one per CTU row)                                    │
+  │  Each row: per-block data bitstream, byte-aligned at row end   │
+  │                                                                │
+  │  Per-block: mode(2b) + [intra_mode(5b) | ref_idx(2b)+MVD(se)]  │
+  │             + dct_flag(1b) + tANS coefficients                 │
+  └─────────────────────────────────────────────────────────────────┘
+```

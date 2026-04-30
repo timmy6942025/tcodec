@@ -22,7 +22,7 @@ ARM NEON SIMD execution. Every algorithm choice prioritizes:
 |---------|--------|-------|
 | 18-mode intra prediction | ✅ Done | Planar, DC, 7 vertical angular, 9 horizontal angular |
 | WHT 4×4 / 8×8 transform | ✅ Done | Self-inverse, uniform dequant |
-| Exp-Golomb coefficient coding | ✅ Done | tANS framework reserved |
+| tANS coefficient coding | ✅ Done | Contextless tANS; context modeling planned |
 | Hierarchical hex motion search | ✅ Done | ±16/32/64 range by preset |
 | 6-tap luma interpolation | ✅ Done | H.264-style half-pel + bilinear quarter-pel |
 | Multi-reference inter prediction | ✅ Done | 4 DPB slots; SLOW preset searches all |
@@ -43,7 +43,7 @@ ARM NEON SIMD execution. Every algorithm choice prioritizes:
 | SAO filter | ❌ Planned | Post-deblock offset filter |
 | DCT-II alternative | ❌ Planned | Requires position-dependent dequant |
 
-### Key Novelty: Variance → DCT Size
+### Key Novelty: Variance → Transform Size
 
 Instead of a full quadtree partition search (expensive), TCodec uses **block
 variance** to select the transform size:
@@ -52,6 +52,9 @@ variance** to select the transform size:
 - **Low variance** (flat, smooth) → 8×8 WHT (better energy compaction, fewer bits)
 
 This gives 80% of quadtree compression efficiency at 20% of the decision cost.
+
+**Note**: The actual transform is the Walsh-Hadamard Transform (WHT), not DCT.
+DCT functions exist in the codebase but are not yet wired into the pipeline.
 
 ---
 
@@ -102,13 +105,13 @@ smaller MVDs when spatial neighbors are available.
 
 ```
 RGB Input → Color Convert (YCbCr 4:2:0) → Frame Buffer
-  → For each CTU row:
+  → For each CTU row (WPP parallel):
       For each CTU:
         1. Variance analysis → WHT size selection (4×4 or 8×8)
-        2. Intra prediction (9 modes, SAD-select best)
+        2. Intra prediction (18 modes, SAD-select best)
         3. Motion estimation (hierarchical hex search, median-predictor-centered)
         4. Mode decision (skip/merge/inter/intra, simplified RDO)
-        5. Forward WHT → Quantize (JND-weighted) → Exp-Golomb encode
+        5. Forward WHT → Quantize (JND-weighted) → tANS encode
         6. Deblock filter (edge strength)
   → Rate control feedback (ρ-domain)
 ```
@@ -116,7 +119,7 @@ RGB Input → Color Convert (YCbCr 4:2:0) → Frame Buffer
 ## Decoding Pipeline
 
 ```
-Bitstream → Exp-Golomb decode → Inverse quantize (JND-weighted) → Inverse WHT
+Bitstream → tANS decode → Inverse quantize (JND-weighted) → Inverse WHT
   → Prediction (intra/inter/merge) → Add residual
   → Deblock filter → Frame buffer → Color Convert (YCbCr → RGB)
 ```
@@ -251,7 +254,7 @@ README is updated with real feature table and build instructions.
 | `src/decoder.c` | Main decode loop: bitstream read, dequantize, reconstruct |
 | `src/entropy.c` | tANS + Exp-Golomb coding |
 | `src/motion.c` | Hierarchical hex search, 6-tap interpolation, SAD |
-| `src/predict.c` | 9 intra modes (planar, DC, angular) |
+| `src/predict.c` | 18 intra modes (planar, DC, 7 vert angular, 9 horiz angular) |
 | `src/transform.c` | WHT 4×4 and 8×8 |
 | `src/quantize.c` | Quantize/dequantize with JND band weighting |
 | `src/filter.c` | Deblocking filter (scalar, guarded by #if !TCODEC_NEON) |
@@ -259,7 +262,7 @@ README is updated with real feature table and build instructions.
 | `src/frame.c` | Frame allocation, DPB management |
 | `src/bitstream.c` | Bitstream reader/writer |
 | `src/ratectl.c` | ρ-domain rate control (CQP/CBR/VBR) |
-| `src/threadpool.c` | Thread pool (exists but NOT WIRED in enc/dec) |
+| `src/threadpool.c` | Thread pool (wired for WPP in enc/dec) |
 | `src/tcodec.c` | Public API implementation |
 | `neon/motion_neon.c` | NEON SAD (wired) + NEON inter predict (NOT wired — bilinear) |
 | `neon/filter_neon.c` | NEON deblock (wired) |

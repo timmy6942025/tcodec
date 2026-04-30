@@ -31,7 +31,7 @@ This document serves as:
 
 | Tool | Code Location | Notes |
 |------|--------------|-------|
-| 9-mode intra prediction | `predict.c` | Planar, DC, 7 angular |
+| 18-mode intra prediction | `predict.c` | Planar, DC, 7 vertical angular, 9 horizontal angular |
 | WHT 4×4 / 8×8 transform | `transform.c` / `transform_neon.c` | Self-inverse, NEON dispatched |
 | Variance-based transform size | `encoder.c` | Threshold = 512 |
 | tANS coefficient coding | `entropy.c` | Replaces Exp-Golomb in pipeline |

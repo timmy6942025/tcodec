@@ -23,23 +23,19 @@ Please read these files first to understand the project state:
 
 Then read the source files in src/ and neon/ to understand the implementation.
 
-## ⚠️ Phase Order Note — We're Doing Phases Out of Order
+## ⚠️ Phase Order Note
 
 The Master Plan's suggested execution order is:
 Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → ...
 
-We have skipped Phases 1 (Benchmark Harness) and 2 (Bitstream Redesign). We are
-doing phases in the following order instead (prioritizing compression wins first):
-Phase 0 → Phase 5 → Phase 3 → Phase 4 → Phase 6 → Phase 7 → Phase 8 → Phase 9 → Phase 10 → Phase 1 → Phase 2
-
-This is NOT the recommended order — benchmarking should come before feature work,
-and bitstream versioning should come before entropy coding changes. However, we are
-proceeding this way to get compression wins early.
+**Phase 0 and Phase 1 are now COMPLETE.** Phase 2 (Bitstream Redesign) is still pending.
+We previously did Phase 5 before Phase 1. The actual order so far:
+Phase 0 ✅ → Phase 5 ✅ → Phase 1 ✅ → Phase 2 ⏸️ → Phase 3 ⏸️ → ...
 
 When continuing on a new computer, you should know:
-- Phases 1 and 2 are skipped for now
-- Phase 3 (entropy coding) comes after Phase 5 (intra modes)
-- The AI_AGENT_PROMPT.md and TODO.md reflect this non-standard order
+- Phases 0, 1, and 5 are complete
+- Phase 2 (bitstream redesign) should be done before Phase 3
+- Phase 3 (entropy coding) is the next major compression win
 
 ## What's Done (Don't Re-do These)
 
@@ -48,7 +44,23 @@ When continuing on a new computer, you should know:
 - ACT-7: WPP thread pool wired — encoder uses per-row bitstream buffers + tANS encoders, dispatches via tc_threadpool_run(), merges byte-aligned row bitstreams with entry point table. Decoder reads entry point table when TC_FLAG_WPP is set, initializes per-row readers, dispatches WPP. Sequential fallback with inter-row byte-alignment skips. TCODEC_NO_THREADS compatible.
 - Phase 5: 18 intra modes — 7 vertical angular (2-8), 9 horizontal angular (9-17), planar + DC. 5-bit encoding. horizontal angular uses left column reference projection.
 - All NEON wiring done except ACT-4 (NEON inter predict uses bilinear, scalar uses 6-tap — wiring would reduce quality)
-- 21 tests pass: color roundtrip, encode/decode at QP 10-50, deterministic, low QP, skip/merge, multi-ref, non-CTU-aligned (96x80), scene cut, CfL chroma, motion quality, fuzz malformed (50 random packets), bitstream error recovery (truncated/bad magic/bad version)
+- 31 tests pass: all original 21 + 10 new Phase 0 tests (large resolution 1920×1080, 100-frame soak, all-intra, decoder mismatch pixel-by-pixel, boundary conditions, CBR rate control, VBR rate control, PSNR reporting, fuzz v2 with systematic edge cases, WPP roundtrip)
+
+**Phase 0 Complete:**
+- Golden corpus: 8 clips × 3 QPs + SHA256 manifest in golden/
+- Architecture diagrams in SPEC.md Appendix A (encoder, decoder, bitstream flow)
+- README.md, PROFILES.md fixed for accuracy (tANS, 18 modes, transform naming)
+- 10 new tests added to test suite
+
+**Phase 1 Complete:**
+- tools/run_benchmark.sh — encode matrix runner (TCodec + x264 + x265 + SVT-AV1)
+- tools/evaluate_quality.py — PSNR/SSIM computation from raw YUV
+- tools/bd_rate.py — BD-rate calculation using scipy interpolation
+- tools/plot_rd.py — RD curve plotting with matplotlib (9 PNGs generated)
+- tools/gen_golden.sh — golden corpus generator
+- Baseline codecs installed: x264, x265, SVT-AV1, ffmpeg
+- First baseline benchmark run: BD-rate vs x264 = -9.7% (synthetic clips, zero-point)
+- Results recorded in BENCHMARKS.md
 
 **Updated documentation:**
 - All 4 spec docs (SPEC, BITSTREAM, PROFILES, BENCHMARKS) updated
@@ -56,25 +68,23 @@ When continuing on a new computer, you should know:
 
 ## What To Do Next (Priority Order)
 
-The remaining work from TODO.md, in priority order (skipping Phases 1 and 2 for now):
+The remaining work from TODO.md, in priority order:
 
-1. **Phase 3: Implement range coder** — entropy.c currently uses tANS framework but with Exp-Golomb. Implement proper range coder (range_coder.c) with encode/decode + renormalization. Wire into coefficient coding path replacing Exp-Golomb. This is the single biggest BD-rate win (~15-30%).
+1. **Phase 2: Rebuild Bitstream for Longevity** — Versioned bitstream syntax (version field + tool flags), profiles/levels, random access points, tiles/slices. This should come before Phase 3 because entropy coding changes will modify the bitstream format.
 
-2. **Phase 7: Add SAO filter skeleton** — Add tc_sao_ctu() function in filter.c. Two types: Edge Offset (EO) for edge direction, Band Offset (BO) for level shift. Per-CTU type signaling in bitstream. Wire after deblock in encoder/decoder.
+2. **Phase 3: Implement range coder** — entropy.c currently uses tANS framework but with Exp-Golomb. Implement proper range coder (range_coder.c) with encode/decode + renormalization. Wire into coefficient coding path replacing Exp-Golomb. This is the single biggest BD-rate win (~15-30%).
 
-3. **Phase 4: Wire DCT-II as alternative transform** — transform.c currently only has WHT. Add tc_fdct4x4/tc_idct4x4 and tc_fdct8x8/tc_idct8x8. Use for low-detail blocks where DCT compresses better. Add transform_type flag in bitstream.
+3. **Phase 7: Add SAO filter skeleton** — Add tc_sao_ctu() function in filter.c. Two types: Edge Offset (EO) for edge direction, Band Offset (BO) for level shift. Per-CTU type signaling in bitstream. Wire after deblock in encoder/decoder.
 
-4. **Phase 6: Add B-frame skeleton** — Add BIDIR frame type support. Bi-prediction (average of two reference frames). COLLOCATED_MV temporal predictor. Update DPB management for 2 reference lists.
+4. **Phase 4: Wire DCT-II as alternative transform** — transform.c currently only has WHT. Add tc_fdct4x4/tc_idct4x4 and tc_fdct8x8/tc_idct8x8. Use for low-detail blocks where DCT compresses better. Add transform_type flag in bitstream.
 
-5. **Phase 8: Add lookahead rate control** — Pre-analyze future frames for QP decisions. Buffer of 5-15 frames. Scene-aware complexity estimation. Improves CBR/VBR quality consistency.
+5. **Phase 6: Add B-frame skeleton** — Add BIDIR frame type support. Bi-prediction (average of two reference frames). COLLOCATED_MV temporal predictor. Update DPB management for 2 reference lists.
 
-6. **Phase 9: ARM/Mobile Decoder Optimization** — Full NEON kernel optimization, WPP row-dependency sync, memory management, Raspberry Pi benchmark.
+6. **Phase 8: Add lookahead rate control** — Pre-analyze future frames for QP decisions. Buffer of 5-15 frames. Scene-aware complexity estimation. Improves CBR/VBR quality consistency.
 
-7. **Phase 10: Ecosystem & Deployment** — Container format, FFmpeg integration, CLI improvements, conformance bitstreams.
+7. **Phase 9: ARM/Mobile Decoder Optimization** — Full NEON kernel optimization, WPP row-dependency sync, memory management, Raspberry Pi benchmark.
 
-8. **Phase 1: Create benchmark harness** — **SKIPPED FOR NOW** — Should be done before Phase 3 ideally. tools/run_benchmark.sh for encode matrix. tools/evaluate_quality.py for VMAF/PSNR extraction. tools/bd_rate.py for BD-rate calculation. Test against x264, x265, SVT-AV1.
-
-9. **Phase 2: Rebuild Bitstream for Longevity** — **SKIPPED FOR NOW** — Should be done before Phase 3 ideally. Versioned bitstream syntax, profiles/levels, tool flags, random access points, tiles/slices.
+8. **Phase 10: Ecosystem & Deployment** — Container format, FFmpeg integration, CLI improvements, conformance bitstreams.
 
 ## Key Architecture Notes
 
@@ -99,15 +109,13 @@ As of this session, the bitstream format has changed (version still 0 but encode
 - WPP bitstreams: entry point table added between header and row data
 - Non-WPP bitstreams: unchanged (sequential row-by-row)
 
-## Phase Order (Non-Standard — See Note Above)
+## Phase Order
 
-We're doing phases out of order. Correct Master Plan order is:
+Correct Master Plan order is:
 Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → ...
 
 Our actual order:
-Phase 0 ✅ → Phase 5 ✅ → Phase 3 ⏸️ → Phase 4 ⏸️ → Phase 6 ⏸️ → Phase 7 ⏸️ → Phase 8 ⏸️ → Phase 9 ⏸️ → Phase 10 ⏸️ → Phase 1 ⚠️ → Phase 2 ⚠️
-
-Phases 1 and 2 are deferred until after the main codec features are done.
+Phase 0 ✅ → Phase 5 ✅ → Phase 1 ✅ → Phase 2 ⏸️ → Phase 3 ⏸️ → Phase 4 ⏸️ → Phase 6 ⏸️ → Phase 7 ⏸️ → Phase 8 ⏸️ → Phase 9 ⏸️ → Phase 10 ⏸️
 ```
 
 ---
@@ -137,6 +145,6 @@ Phases 1 and 2 are deferred until after the main codec features are done.
 | `include/tcodec.h` | Public API: encoder, decoder, config, PSNR |
 | `include/tcodec_common.h` | Internal constants: CTU_SIZE, TC_VERSION, QP limits |
 | `include/tcodec_types.h` | Types: tc_pixel_t, tc_mv_s, tc_frame_t, TC_FLAG_WPP |
-| `test/test_tcodec.c` | 21 tests |
+| `test/test_tcodec.c` | 31 tests |
 | `tools/tcenc.c` | Encoder CLI |
 | `tools/tcdec.c` | Decoder CLI |
