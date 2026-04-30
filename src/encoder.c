@@ -4,7 +4,7 @@
  * Pipeline:
  *   1. Frame header write
  *   2. For each CTU (with WPP parallelism):
- *      a. Intra prediction (9 modes, SAD-select best)
+ *      a. Intra prediction (18 modes, SAD-select best)
  *      b. Motion estimation (hierarchical hex search, inter frames)
  *      c. Mode decision (intra vs inter vs skip, simplified RDO)
  *      d. Forward DCT → Quantize → tANS encode
@@ -95,7 +95,8 @@ static double histogram_distance(const tc_pixel_t *cur, int cur_stride,
 static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
                          int blk_idx, int bx, int by,
                          int frame_x, int frame_y,
-                         int qp, tc_frame_type_t frame_type)
+                         int qp, tc_frame_type_t frame_type,
+                         tc_bs_writer_t *bs, tc_tans_enc_t *tans)
 {
     tc_block_info_t *blk = &ctu->blocks[blk_idx];
 
@@ -127,7 +128,7 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
     tc_intra_mode_t best_intra = TC_INTRA_DC;
     tc_sad_t best_intra_sad = 0x7FFFFFFF;
 
-    /* Try all 9 intra modes */
+    /* Try all 18 intra modes */
     for (int m = 0; m < TC_INTRA_MODES; m++) {
         tc_pixel_t tmp_pred[64];
         tc_intra_predict(tmp_pred, blk_size,
@@ -369,18 +370,18 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
     if (frame_type != TC_FRAME_KEY) {
         /* Mode: 0=skip, 1=inter, 2=intra, 3=merge (2 bits) */
         if (is_merge) {
-            tc_bs_writer_write_bits(&enc->bs, 3, 2);  /* merge */
+            tc_bs_writer_write_bits(bs, 3, 2);  /* merge */
         } else if (is_skip) {
-            tc_bs_writer_write_bits(&enc->bs, 0, 2);  /* skip */
+            tc_bs_writer_write_bits(bs, 0, 2);  /* skip */
         } else if (blk->is_intra) {
-            tc_bs_writer_write_bits(&enc->bs, 2, 2);  /* intra */
+            tc_bs_writer_write_bits(bs, 2, 2);  /* intra */
         } else {
-            tc_bs_writer_write_bits(&enc->bs, 1, 2);  /* inter with residual */
+            tc_bs_writer_write_bits(bs, 1, 2);  /* inter with residual */
         }
     }
 
     if (blk->is_intra && !is_skip && !is_merge) {
-        tc_bs_writer_write_bits(&enc->bs, (uint32_t)blk->intra_mode, 4);
+        tc_bs_writer_write_bits(bs, (uint32_t)blk->intra_mode, 5);
     }
 
     /* ref_idx + MVD: written for inter/skip only (NOT merge — merge
@@ -389,7 +390,7 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
         /* Write ref_idx (2 bits, supports up to 4 reference frames).
          * Only written for inter/skip blocks on P-frames. */
         if (frame_type != TC_FRAME_KEY) {
-            tc_bs_writer_write_bits(&enc->bs, (uint32_t)blk->ref_idx, 2);
+            tc_bs_writer_write_bits(bs, (uint32_t)blk->ref_idx, 2);
         }
         /* Write MVD for inter/skip blocks.
          * Skip blocks carry the actual MV — skip means zero residual,
@@ -400,8 +401,8 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
          * matching the decoder's predictor_mv derivation exactly. */
         int32_t mvd_x = blk->mv.x - merge_mv.x;
         int32_t mvd_y = blk->mv.y - merge_mv.y;
-        tc_bs_writer_write_se(&enc->bs, mvd_x);
-        tc_bs_writer_write_se(&enc->bs, mvd_y);
+        tc_bs_writer_write_se(bs, mvd_x);
+        tc_bs_writer_write_se(bs, mvd_y);
     }
 
     /* ── Reconstruct + encode coefficients ──────────────────── */
@@ -419,7 +420,7 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
         }
     } else {
         /* Non-skip/non-merge: write DCT flag, encode coefficients, reconstruct */
-        tc_bs_writer_write_bits(&enc->bs, dct_size_id, 1);
+        tc_bs_writer_write_bits(bs, dct_size_id, 1);
 
         /* ── tANS encode coefficients ────────────────────────── */
         if (dct_size_id == TC_BLOCK_4x4_ID) {
@@ -431,11 +432,11 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
                             sub[r * 4 + c] = dct_out[(sy * 4 + r) * 8 + (sx * 4 + c)];
                         }
                     }
-                    tc_tans_enc_coeffs(&enc->tans, sub, 16, TC_BLOCK_4x4_ID);
+                    tc_tans_enc_coeffs(tans, sub, 16, TC_BLOCK_4x4_ID);
                 }
             }
         } else {
-            tc_tans_enc_coeffs(&enc->tans, dct_out, n_coeff, TC_BLOCK_8x8_ID);
+            tc_tans_enc_coeffs(tans, dct_out, n_coeff, TC_BLOCK_8x8_ID);
         }
 
         /* ── Reconstruct (dequantize + IDCT + add prediction) ── */
@@ -566,7 +567,7 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
         /* DCT + quantize + encode (residual-mode) */
         tc_fwht4x4(c_res, 4, c_dct);
         tc_quantize(c_dct, 16, tc_clip(qp + 1, 0, 63), 0);
-        tc_tans_enc_coeffs(&enc->tans, c_dct, 16, TC_BLOCK_4x4_ID);
+        tc_tans_enc_coeffs(tans, c_dct, 16, TC_BLOCK_4x4_ID);
 
         /* Reconstruct chroma */
         tc_dequantize(c_dct, 16, tc_clip(qp + 1, 0, 63), 0);
@@ -583,13 +584,40 @@ static void encode_block(tc_encoder_t *enc, tc_ctu_info_t *ctu,
     }
 }
 
+/* ── Bitstream merge helper ─────────────────────────────────────
+ *
+ * Merge a row's per-row bitstream buffer into the main output buffer
+ * at the bit level. This preserves bit-exact output whether WPP
+ * (per-row buffers) or sequential (single buffer) is used.
+ * ══════════════════════════════════════════════════════════════ */
+
+static void merge_row_bitstream(tc_bs_writer_t *main_bs,
+                                 const uint8_t *row_buf, size_t row_bytes,
+                                 int row_bit_pos)
+{
+    /* Copy full bytes first */
+    for (size_t i = 0; i < row_bytes; i++) {
+        tc_bs_writer_write_bits(main_bs, row_buf[i], 8);
+    }
+
+    /* Copy remaining partial byte (bit_pos bits from the MSB side) */
+    if (row_bit_pos > 0) {
+        uint8_t partial = row_buf[row_bytes];
+        int shift = 8 - row_bit_pos;
+        uint8_t bits = partial >> shift;
+        tc_bs_writer_write_bits(main_bs, bits, row_bit_pos);
+    }
+}
+
 /* ── Encode one CTU row (WPP unit) ──────────────────────────── */
 
 typedef struct {
     tc_encoder_t *enc;
-    int row;
     int qp;
     tc_frame_type_t frame_type;
+#if !defined(TCODEC_NO_THREADS)
+    int use_wpp;       /* 1 = use per-row buffers, 0 = use main buffer */
+#endif
 } enc_row_ctx_t;
 
 static void encode_row(void *ctx, int row)
@@ -597,6 +625,31 @@ static void encode_row(void *ctx, int row)
     enc_row_ctx_t *rctx = (enc_row_ctx_t *)ctx;
     tc_encoder_t *enc = rctx->enc;
     int qp = rctx->qp;
+
+    /* Select bitstream writer and tANS encoder for this row.
+     * When WPP is active, each row uses its own buffer to allow
+     * parallel writes. When sequential, all rows share the main buffer.
+     *
+     * Note: WPP mode resets tANS state per row (standard WPP entry point
+     * design, matching HEVC). Currently invisible since tANS is Exp-Golomb,
+     * but will cause a small compression regression when real tANS is
+     * implemented (Phase 3) — each row re-initializes its probability tables. */
+    tc_bs_writer_t *bs;
+    tc_tans_enc_t  *tans;
+#if !defined(TCODEC_NO_THREADS)
+    if (rctx->use_wpp) {
+        bs   = &enc->row_bs[row];
+        tans = &enc->row_tans[row];
+        /* Zero per-row buffer for deterministic encoding */
+        memset(enc->row_buf[row], 0, enc->row_buf_size[row]);
+        tc_bs_writer_init(bs, enc->row_buf[row], enc->row_buf_size[row]);
+        tc_tans_enc_init(tans, bs);
+    } else
+#endif
+    {
+        bs   = &enc->bs;
+        tans = &enc->tans;
+    }
 
     for (int col = 0; col < enc->num_ctu_cols; col++) {
         int ctu_x = col * TC_CTU_SIZE;
@@ -619,7 +672,7 @@ static void encode_row(void *ctx, int row)
                      * (written only for non-skip blocks) */
                     encode_block(enc, ctu, blk_idx, bx, by,
                                  blk_x, blk_y,
-                                 qp, rctx->frame_type);
+                                 qp, rctx->frame_type, bs, tans);
                 }
             }
         }
@@ -633,6 +686,20 @@ static void encode_row(void *ctx, int row)
                            ctu_x, ctu_y, qp);
         }
     }
+
+#if !defined(TCODEC_NO_THREADS)
+    /* Flush per-row tANS state and byte-align.
+     * WPP rows must be byte-aligned so the decoder can locate
+     * row boundaries via byte offsets in the entry point table.
+     * This makes WPP bitstreams differ from sequential ones
+     * (sequential rows are NOT byte-aligned between boundaries),
+     * but the TC_FLAG_WPP flag in the header tells the decoder
+     * which format to expect. */
+    if (rctx->use_wpp) {
+        tc_tans_enc_flush(tans);
+        tc_bs_writer_byte_align(bs);
+    }
+#endif
 }
 
 /* ── Frame header write ──────────────────────────────────────── */
@@ -701,10 +768,50 @@ tc_encoder_t *tc_encoder_create(const tc_config_t *config)
     /* Determine thread count */
     int num_threads = config->threads;
     if (num_threads <= 0) num_threads = 4;  /* Default for ARM quad-core */
+    enc->num_threads = num_threads;
 
-    enc->row_done = (int *)calloc((size_t)enc->num_ctu_rows, sizeof(int));
-    pthread_mutex_init(&enc->row_mutex, NULL);
-    pthread_cond_init(&enc->row_cond, NULL);
+    /* Use WPP when there are multiple CTU rows and >1 thread */
+    enc->use_wpp = (enc->num_ctu_rows > 1 && num_threads > 1) ? 1 : 0;
+
+    if (enc->use_wpp) {
+        /* Create thread pool */
+        enc->pool = tc_threadpool_create(num_threads);
+        if (!enc->pool) {
+            /* Fallback: no WPP, still functional */
+            enc->use_wpp = 0;
+        }
+    } else {
+        enc->pool = NULL;
+    }
+
+    /* Allocate per-row bitstream buffers (used by WPP or as scratch) */
+    int max_rows = enc->num_ctu_rows;
+    enc->row_bs       = (tc_bs_writer_t *)calloc((size_t)max_rows, sizeof(tc_bs_writer_t));
+    enc->row_tans     = (tc_tans_enc_t *)calloc((size_t)max_rows, sizeof(tc_tans_enc_t));
+    enc->row_buf      = (uint8_t **)calloc((size_t)max_rows, sizeof(uint8_t *));
+    enc->row_buf_size = (size_t *)calloc((size_t)max_rows, sizeof(size_t));
+
+    if (enc->row_bs && enc->row_buf && enc->row_buf_size) {
+        /* Per-row buffer: generous size per row (worst case = 1 row's share of output) */
+        size_t per_row_size = enc->out_buf_size / (size_t)tc_max(max_rows, 1) + 256;
+        for (int i = 0; i < max_rows; i++) {
+            enc->row_buf[i] = (uint8_t *)calloc(per_row_size, 1);
+            enc->row_buf_size[i] = per_row_size;
+            if (!enc->row_buf[i]) {
+                /* Out of memory for per-row buffers — fall back to sequential.
+                 * Also destroy the pool to avoid idle worker threads. */
+                enc->use_wpp = 0;
+                tc_threadpool_destroy(enc->pool);
+                enc->pool = NULL;
+                break;
+            }
+        }
+    } else {
+        /* Allocation failed — fall back to sequential, destroy pool */
+        enc->use_wpp = 0;
+        tc_threadpool_destroy(enc->pool);
+        enc->pool = NULL;
+    }
 #else
     (void)config->threads;
 #endif
@@ -723,9 +830,18 @@ void tc_encoder_destroy(tc_encoder_t *enc)
     free(enc->ctu_data);
     free(enc->out_buf);
 #if !defined(TCODEC_NO_THREADS)
-    free(enc->row_done);
-    pthread_mutex_destroy(&enc->row_mutex);
-    pthread_cond_destroy(&enc->row_cond);
+    /* Free per-row bitstream buffers */
+    if (enc->row_buf) {
+        for (int i = 0; i < enc->num_ctu_rows; i++) {
+            free(enc->row_buf[i]);
+        }
+    }
+    free(enc->row_buf);
+    free(enc->row_buf_size);
+    free(enc->row_bs);
+    free(enc->row_tans);
+    /* Destroy thread pool */
+    tc_threadpool_destroy(enc->pool);
 #endif
     free(enc);
 }
@@ -819,6 +935,9 @@ tc_error_t tc_encoder_encode(tc_encoder_t *enc,
     hdr.width    = (uint16_t)enc->cfg.width;
     hdr.height   = (uint16_t)enc->cfg.height;
     hdr.flags    = is_key ? TC_FLAG_KEY_FRAME : 0;
+#if !defined(TCODEC_NO_THREADS)
+    if (enc->use_wpp) hdr.flags |= TC_FLAG_WPP;
+#endif
     hdr.qp_delta = (uint8_t)(int8_t)(qp - TC_QP_DEFAULT);
     hdr.frame_num = (uint8_t)(enc->frame_count & 0xFF);
     hdr.reserved  = 0;
@@ -842,24 +961,80 @@ tc_error_t tc_encoder_encode(tc_encoder_t *enc,
         }
     }
 
-#if !defined(TCODEC_NO_THREADS)
-    /* Reset row completion flags */
-    memset(enc->row_done, 0, (size_t)enc->num_ctu_rows * sizeof(int));
-#endif
-
-    /* Encode CTU rows (sequential for now; WPP with thread pool can be added) */
+    /* Encode CTU rows with WPP parallelism or sequential fallback */
     enc_row_ctx_t rctx;
     rctx.enc = enc;
     rctx.qp = qp;
     rctx.frame_type = frame_type;
 
-    for (int row = 0; row < enc->num_ctu_rows; row++) {
-        encode_row(&rctx, row);
-    }
+#if !defined(TCODEC_NO_THREADS)
+    rctx.use_wpp = enc->use_wpp;
 
-    /* Flush tANS */
-    tc_tans_enc_flush(&enc->tans);
-    tc_bs_writer_byte_align(&enc->bs);
+    if (enc->use_wpp) {
+        /* WPP: each row gets its own byte-aligned bitstream buffer.
+         * An entry point table is written between header and row data
+         * so the decoder can locate each row for parallel decoding.
+         *
+         * Bitstream layout (WPP):
+         *   [header] [entry_point_table] [row0 data] [row1 data] ...
+         *
+         * Entry point table:
+         *   num_offsets (16 bits) = num_ctu_rows - 1
+         *   offset[0..N-2] (16 bits each) = byte offset from row data
+         *       start to each row's start (row 0 is always at offset 0)
+         *   [byte-align padding]
+         *
+         * IMPORTANT: rctx is read-only during tc_threadpool_run.
+         * Worker threads only read enc/qp/frame_type/use_wpp — they
+         * never modify rctx. This is safe for concurrent access. */
+
+        /* Write entry point table (placeholder offsets, filled after merge) */
+        int num_offsets = enc->num_ctu_rows - 1;
+        tc_bs_writer_write_bits(&enc->bs, (uint32_t)num_offsets, 16);
+        size_t offset_table_start = enc->bs.byte_pos;
+        for (int i = 0; i < num_offsets; i++) {
+            tc_bs_writer_write_bits(&enc->bs, 0, 16);  /* Placeholder */
+        }
+        tc_bs_writer_byte_align(&enc->bs);
+        size_t row_data_start = enc->bs.byte_pos;
+
+        /* Run WPP */
+        tc_threadpool_run(enc->pool, encode_row, &rctx, enc->num_ctu_rows);
+
+        /* Merge per-row bitstreams via memcpy (rows are byte-aligned).
+         * Track the byte offset of each row for the entry point table. */
+        size_t row_offsets[64];  /* Max CTU rows: 4096/64 = 64 */
+        for (int row = 0; row < enc->num_ctu_rows; row++) {
+            row_offsets[row] = enc->bs.byte_pos - row_data_start;
+            size_t row_bytes = enc->row_bs[row].byte_pos;  /* bit_pos=0 (byte-aligned) */
+            if (row_bytes > 0) {
+                memcpy(enc->out_buf + enc->bs.byte_pos,
+                       enc->row_buf[row], row_bytes);
+            }
+            enc->bs.byte_pos += row_bytes;
+            /* bit_pos stays 0 — rows are byte-aligned */
+        }
+
+        /* Fill in entry point table with actual offsets (direct buffer write) */
+        for (int i = 0; i < num_offsets; i++) {
+            uint16_t off = (uint16_t)row_offsets[i + 1];
+            enc->out_buf[offset_table_start + i * 2]     = (uint8_t)(off >> 8);
+            enc->out_buf[offset_table_start + i * 2 + 1] = (uint8_t)(off & 0xFF);
+        }
+
+        /* No byte-align needed — last row is already byte-aligned */
+    } else
+#endif
+    {
+        /* Sequential: all rows write to main bitstream */
+        for (int row = 0; row < enc->num_ctu_rows; row++) {
+            encode_row(&rctx, row);
+        }
+
+        /* Flush tANS (shared across all rows) */
+        tc_tans_enc_flush(&enc->tans);
+        tc_bs_writer_byte_align(&enc->bs);
+    }
 
     /* Update rate control */
     size_t frame_bytes = tc_bs_writer_bytes(&enc->bs);

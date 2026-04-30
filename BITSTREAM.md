@@ -78,7 +78,8 @@ next byte boundary).
 | Bit | Mask | Field | Description |
 |-----|------|-------|-------------|
 | 7 | `0x80` | `key_frame` | 1 = I-frame (intra-only), 0 = P-frame |
-| 3–6 | — | `reserved` | Must be 0 |
+| 6 | `0x40` | `wpp` | 1 = WPP row entry points present |
+| 3–5 | — | `reserved` | Must be 0 |
 | 2–3 | `0x0C` | `tile_cols_log2` | log2 of tile columns (0 = 1 col) |
 | 0–1 | `0x03` | `tile_rows_log2` | log2 of tile rows (0 = 1 row) |
 
@@ -138,10 +139,31 @@ block_mode: 2 bits                 (0=skip, 1=inter, 2=intra, 3=merge)
 Read only when `block_mode == 2` (intra) or on key frames.
 
 ```
-intra_mode: 4 bits (unsigned)     (0..8, see intra mode table)
+intra_mode: 5 bits (unsigned)     (0..17, see intra mode table)
 ```
 
-If `intra_mode >= 9`, decoder falls back to DC (mode 1).
+If `intra_mode >= 18`, decoder falls back to DC (mode 1).
+
+| Value | Name | Direction | Displacement |
+|-------|------|-----------|-------------|
+| 0 | Planar | Bilinear | — |
+| 1 | DC | Average | — |
+| 2 | Angular NE | ~45° vertical | +1.0 px/row |
+| 3 | Angular NNE | ~26° vertical | +0.5 px/row |
+| 4 | Angular NNW | ~11° vertical | +0.19 px/row |
+| 5 | Angular N (vert) | 0° vertical | 0 px/row |
+| 6 | Angular NWW | ~-11° vertical | -0.19 px/row |
+| 7 | Angular NW | ~-26° vertical | -0.5 px/row |
+| 8 | Angular WN | ~-45° vertical | -1.0 px/row |
+| 9 | Angular EN | ~45° horizontal | +1.0 px/col |
+| 10 | Angular EEN | ~26° horizontal | +0.5 px/col |
+| 11 | Angular EE | ~11° horizontal | +0.19 px/col |
+| 12 | Angular E (horiz) | 0° horizontal | 0 px/col |
+| 13 | Angular WW | ~-11° horizontal | -0.19 px/col |
+| 14 | Angular WWN | ~-26° horizontal | -0.5 px/col |
+| 15 | Angular WN (horiz) | ~-45° horizontal | -1.0 px/col |
+| 16 | Angular NNW (horiz) | ~-56° horizontal | -1.5 px/col |
+| 17 | Angular NNE (horiz) | ~56° horizontal | +1.5 px/col |
 
 #### 4.2.3 Inter/Skip Block (mode 0 or 1)
 
@@ -387,7 +409,7 @@ ctu_data(row, col) {
 
             // Prediction data
             if (block_mode == 2) {         // intra
-                intra_mode = u(4)   // 0..8
+                intra_mode = u(5)   // 0..17
             } else if (block_mode == 3) {  // merge
                 // MV derived from median of spatial neighbors
                 // No ref_idx or MVD signaled
@@ -444,7 +466,7 @@ Current decoder behavior on malformed bitstreams:
 | Invalid magic | Return `TC_ERR_BITSTREAM` |
 | Invalid version | Accepted (not checked beyond reading) |
 | EOF mid-header | Return `TC_ERR_EOF` |
-| Invalid intra mode (≥9) | Clamp to DC (mode 1) |
+| Invalid intra mode (≥18) | Clamp to DC (mode 1) |
 | `last_nz_plus1 > n` | Clamp to `n - 1` |
 | Out-of-bounds MV | Fallback to DC(128) prediction — safe degradation |
 | Invalid ref_idx (≥4) | Clamp to 0 |
@@ -457,10 +479,11 @@ Current decoder behavior on malformed bitstreams:
 3. **No random access points**: Must decode from first frame
 4. **No error resilience**: A single bit error corrupts all subsequent data
 5. **Fixed header size**: No extension mechanism for new fields
-6. **No tile/slice boundaries**: No parallelism markers in bitstream
+6. **WPP entry points**: When TC_FLAG_WPP is set, an entry point table follows the header
 7. **Reference frame signaling**: 4 DPB slots, ref_idx coded per block (2 bits)
 8. **No bit-rate signaling**: Target bitrate not stored in bitstream
 9. **NEON/scalar output divergence**: NEON deblock uses different filter strength than scalar
+10. **WPP/sequential bitstream divergence**: WPP bitstreams byte-align per row (sequential do not)
 
 ---
 

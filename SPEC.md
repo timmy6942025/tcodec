@@ -88,23 +88,36 @@ position-dependent scaling that the current dequantizer doesn't provide.
 
 ### 4.2 Intra Prediction
 
-**9 modes** for luma:
+**18 modes** for luma (5-bit signaling):
 
-| Mode | Name | Description |
-|------|------|-------------|
-| 0 | Planar | Bilinear interpolation from top + left boundaries |
-| 1 | DC | Average of above and left reference samples |
-| 2 | Angular NE | ~45° direction, displacement +1.0 px/row |
-| 3 | Angular NNE | ~26° direction, displacement +0.5 px/row |
-| 4 | Angular NNW | ~11° direction, displacement +0.19 px/row |
-| 5 | Angular N (vertical) | 0° direction, displacement 0 px/row |
-| 6 | Angular NW | ~-11° direction, displacement -0.19 px/row |
-| 7 | Angular WN | ~-26° direction, displacement -0.5 px/row |
-| 8 | Angular W | ~-45° direction, displacement -1.0 px/row |
+| Mode | Name | Direction | Displacement |
+|------|------|-----------|-------------|
+| 0 | Planar | Bilinear | — |
+| 1 | DC | Average | — |
+| 2 | Angular NE | ~45° vertical | +1.0 px/row |
+| 3 | Angular NNE | ~26° vertical | +0.5 px/row |
+| 4 | Angular NNW | ~11° vertical | +0.19 px/row |
+| 5 | Angular N (vert) | 0° vertical | 0 px/row |
+| 6 | Angular NWW | ~-11° vertical | -0.19 px/row |
+| 7 | Angular NW | ~-26° vertical | -0.5 px/row |
+| 8 | Angular WN | ~-45° vertical | -1.0 px/row |
+| 9 | Angular EN | ~45° horizontal | +1.0 px/col |
+| 10 | Angular EEN | ~26° horizontal | +0.5 px/col |
+| 11 | Angular EE | ~11° horizontal | +0.19 px/col |
+| 12 | Angular E (horiz) | 0° horizontal | 0 px/col |
+| 13 | Angular WW | ~-11° horizontal | -0.19 px/col |
+| 14 | Angular WWN | ~-26° horizontal | -0.5 px/col |
+| 15 | Angular WN (horiz) | ~-45° horizontal | -1.0 px/col |
+| 16 | Angular NNW (horiz) | ~-56° horizontal | -1.5 px/col |
+| 17 | Angular NNE (horiz) | ~56° horizontal | +1.5 px/col |
 
 Angular modes use 1/32 pixel precision (5-bit fractional part) for
 reference projection, with bilinear interpolation from above or left
-reference samples.
+reference samples. Vertical angular modes (2–8) project onto the above
+reference row; horizontal angular modes (9–17) project onto the left
+reference column. When the projection falls outside the available
+reference samples, the alternate reference is used (e.g., steep vertical
+modes use left column, steep horizontal modes use above row).
 
 **Mode decision**: SAD (Sum of Absolute Differences) between original
 and predicted block. Lowest-SAD mode wins. No rate-distortion cost
@@ -178,7 +191,7 @@ residual zero-check + merge availability.
 |------|-------|----------|-----------|---------------|
 | Skip | 0 | Zero | MVD + ref_idx | mode(2) + ref_idx(2) + MVD(se+se) |
 | Inter | 1 | Non-zero | MVD + ref_idx | mode(2) + ref_idx(2) + MVD(se+se) + dct_flag(1) + coeffs |
-| Intra | 2 | Non-zero | None (intra pred) | mode(2) + intra_mode(4) + dct_flag(1) + coeffs |
+| Intra | 2 | Non-zero | None (intra pred) | mode(2) + intra_mode(5) + dct_flag(1) + coeffs |
 | Merge | 3 | Zero | Median of neighbors | mode(2) only |
 
 **Merge mode** derives the MV from the median of spatial neighbors'
@@ -349,11 +362,22 @@ Infrastructure exists in `threadpool.c`:
 
 ### 8.2 Current Status
 
-**NOT ACTIVE**. The encoder and decoder process CTU rows sequentially
-with a simple `for` loop. Thread pool is allocated at encoder/decoder
-creation but never used for encoding/decoding.
+**ACTIVE**. Both encoder and decoder use WPP (Wavefront Parallel Processing)
+via the thread pool when multiple CTU rows exist and threading is enabled.
+
+- **Encoder**: When `use_wpp=1`, each CTU row gets its own bitstream buffer
+  and tANS encoder. Rows execute in parallel via `tc_threadpool_run()`,
+  then per-row bitstreams are byte-aligned and merged with an entry point
+  table. The `TC_FLAG_WPP` flag is set in the frame header.
+- **Decoder**: When `TC_FLAG_WPP` is set, the decoder parses the entry point
+  table to locate each row's data, initializes per-row bitstream readers,
+  and dispatches rows via `tc_threadpool_run()`. Falls back to sequential
+  decoding with inter-row byte-alignment skips when threading is unavailable.
+- **Bitstream**: WPP frames have an entry point table between header and row data,
+  containing byte offsets to each row. Non-WPP frames have no such table.
 
 The `TCODEC_NO_THREADS` compile flag disables all threading code.
+WPP bitstreams can still be decoded sequentially when threads are disabled.
 
 ---
 
@@ -385,7 +409,7 @@ uses bilinear interpolation while the scalar version uses a proper
 ### Working (Verified by Tests — 19 tests pass)
 
 - Encode/decode roundtrip for I-frames and P-frames
-- Intra prediction (9 modes, SAD mode decision)
+- Intra prediction (18 modes, SAD mode decision)
 - Inter prediction (hex search centered on median predictor, 6-tap luma + bilinear quarter-pel)
 - WHT forward/inverse with JND-weighted quantize/dequantize
 - tANS coefficient coding (replaces Exp-Golomb in pipeline)
@@ -424,4 +448,4 @@ uses bilinear interpolation while the scalar version uses a proper
 - Container format integration
 - Bi-prediction / B-frames
 - Quadtree partitioning
-- More than 9 intra modes
+- More intra mode RDO (rate-distortion optimized mode decision)

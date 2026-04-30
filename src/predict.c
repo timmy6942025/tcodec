@@ -1,10 +1,11 @@
 /*
  * predict.c — Intra prediction for TCodec
  *
- * 9 intra prediction modes:
+ * 18 intra prediction modes:
  *   0: Planar  (bilinear interpolation from boundaries)
  *   1: DC      (average of reference samples)
- *   2..8: Angular (directional prediction along 7 angles)
+ *   2..8: Vertical angular (directional prediction along 7 angles)
+ *   9..17: Horizontal angular (directional prediction along 9 angles)
  *
  * Reference samples come from:
  *   - Above: reconstructed pixels directly above the block
@@ -150,27 +151,27 @@ static void intra_dc(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
     }
 }
 
-/* ── Angular prediction (Modes 2..8) ────────────────────────────
+/* ── Vertical angular prediction (Modes 2..8) ──────────────────
  *
- * Directional prediction along angles:
+ * Directional prediction projecting onto the above reference row:
  *   Mode 2: angle ≈ 45° NE   (intraRightUp)
- *   Mode 3: angle ≈ 26° NE   (intraUpRight)
- *   Mode 4: angle ≈ 11° NNE
+ *   Mode 3: angle ≈ 26° NNE  (intraUpRight)
+ *   Mode 4: angle ≈ 11° NNW
  *   Mode 5: angle =  0°  N   (vertical)
- *   Mode 6: angle ≈ -11° NNW
+ *   Mode 6: angle ≈ -11° NWW
  *   Mode 7: angle ≈ -26° NW  (intraUpLeft)
  *   Mode 8: angle ≈ -45° WN  (intraLeftUp)
  *
- * Simplified: we project each pixel (x,y) back along the
- * prediction direction to find the reference position, then
- * interpolate from the reference samples.
+ * Each pixel (x,y) is projected back along the prediction direction
+ * to find the reference position on the above row or left column,
+ * then interpolated from the reference samples.
  *
- * For performance, we use integer math with 1/32 precision.
+ * Integer math with 1/32 pixel precision.
  * ══════════════════════════════════════════════════════════════ */
 
-/* Angle table: inverse displacement per row, in 1/32 pixel units.
- * Positive = projects to above, negative = projects to left. */
-static const int angular_disp[7] = {
+/* Displacement per row, in 1/32 pixel units.
+ * Positive = projects to above-right, negative = projects to left. */
+static const int angular_disp_vert[7] = {
      32,    /* Mode 2:  1.0  px/row (45°)    */
      16,    /* Mode 3:  0.5  px/row (26°)    */
       6,    /* Mode 4:  0.19 px/row (11°)    */
@@ -180,13 +181,14 @@ static const int angular_disp[7] = {
     -32,    /* Mode 8: -1.0  px/row (-45°)   */
 };
 
-static void intra_angular(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
-                          const tc_pixel_t *ref_above,
-                          const tc_pixel_t *ref_left,
-                          int blk_size, int mode_idx)
+static void intra_angular_vert(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
+                               const tc_pixel_t *ref_above,
+                               const tc_pixel_t *ref_left,
+                               int blk_size, int mode_idx)
 {
-    int disp = angular_disp[mode_idx - 2];  /* Index into displacement table */
-    int frac_bits = 5;                       /* 1/32 pixel precision */
+    int disp = angular_disp_vert[mode_idx - 2];  /* Index into displacement table */
+    int frac_bits = 5;                            /* 1/32 pixel precision */
+    int max_idx = 2 * blk_size;                   /* Max ref sample index */
 
     for (int y = 0; y < blk_size; y++) {
         for (int x = 0; x < blk_size; x++) {
@@ -199,9 +201,8 @@ static void intra_angular(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
                 int frac    = ref_pos_x & ((1 << frac_bits) - 1);
                 int idx0 = abs_pos + 1;  /* +1 because ref_above[0] = above-left */
 
-                /* Bilinear interpolation from above */
-                int p0 = ref_above[tc_clip(idx0, 0, 2 * blk_size)];
-                int p1 = ref_above[tc_clip(idx0 + 1, 0, 2 * blk_size)];
+                int p0 = ref_above[tc_clip(idx0, 0, max_idx)];
+                int p1 = ref_above[tc_clip(idx0 + 1, 0, max_idx)];
 
                 int pred = p0 + (((p1 - p0) * frac + (1 << (frac_bits - 1))) >> frac_bits);
                 dst[y * dst_stride + x] = (tc_pixel_t)tc_clip(pred, 0, 255);
@@ -211,8 +212,87 @@ static void intra_angular(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
                 int frac    = (-ref_pos_x) & ((1 << frac_bits) - 1);
                 int idx0 = abs_pos + 1;
 
-                int p0 = ref_left[tc_clip(idx0, 0, 2 * blk_size)];
-                int p1 = ref_left[tc_clip(idx0 + 1, 0, 2 * blk_size)];
+                int p0 = ref_left[tc_clip(idx0, 0, max_idx)];
+                int p1 = ref_left[tc_clip(idx0 + 1, 0, max_idx)];
+
+                int pred = p0 + (((p1 - p0) * frac + (1 << (frac_bits - 1))) >> frac_bits);
+                dst[y * dst_stride + x] = (tc_pixel_t)tc_clip(pred, 0, 255);
+            }
+        }
+    }
+}
+
+/* ── Horizontal angular prediction (Modes 9..17) ────────────────
+ *
+ * Directional prediction projecting onto the left reference column.
+ * Mirror of vertical angular modes but with the primary reference
+ * on the left column and displacement applied per column.
+ *
+ *   Mode 9:  angle ≈ 45° EN   (going right projects down-left)
+ *   Mode 10: angle ≈ 26° EEN
+ *   Mode 11: angle ≈ 11° EE(N)
+ *   Mode 12: angle =  0°  E   (horizontal)
+ *   Mode 13: angle ≈ -11° WW(N)
+ *   Mode 14: angle ≈ -26° WWN
+ *   Mode 15: angle ≈ -45° WN  (going right projects up-left)
+ *   Mode 16: angle ≈ -56° NNW (steep near-vertical, horiz-biased)
+ *   Mode 17: angle ≈  56° NNE (steep near-vertical, horiz-biased)
+ *
+ * Each pixel (x,y) is projected back along the prediction direction
+ * to find the reference position on the left column or above row.
+ * Integer math with 1/32 pixel precision.
+ * ══════════════════════════════════════════════════════════════ */
+
+/* Displacement per column, in 1/32 pixel units.
+ * Positive = going right projects further down the left column.
+ * Negative = going right projects further up the left column. */
+static const int angular_disp_horiz[9] = {
+     32,    /* Mode 9:  1.0  px/col (45° EN)    */
+     16,    /* Mode 10: 0.5  px/col (26° EEN)   */
+      6,    /* Mode 11: 0.19 px/col (11° EE)    */
+      0,    /* Mode 12: 0    px/col (0° = horizontal) */
+     -6,    /* Mode 13: -0.19 px/col (-11° WW)  */
+    -16,    /* Mode 14: -0.5  px/col (-26° WWN) */
+    -32,    /* Mode 15: -1.0  px/col (-45° WN)  */
+    -48,    /* Mode 16: -1.5  px/col (-56° NNW) */
+     48,    /* Mode 17: 1.5   px/col (56° NNE) */
+};
+
+static void intra_angular_horiz(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
+                                const tc_pixel_t *ref_above,
+                                const tc_pixel_t *ref_left,
+                                int blk_size, int mode_idx)
+{
+    int disp = angular_disp_horiz[mode_idx - 9];  /* Index into displacement table */
+    int frac_bits = 5;                             /* 1/32 pixel precision */
+    int max_idx = 2 * blk_size;                    /* Max ref sample index */
+
+    for (int y = 0; y < blk_size; y++) {
+        for (int x = 0; x < blk_size; x++) {
+            /* Project (x,y) along direction to find reference position.
+             * For horizontal modes, the primary reference is the left column.
+             * ref_pos_y = position along the left column (in 1/32 units). */
+            int ref_pos_y = (y << frac_bits) + x * disp;
+
+            if (disp >= 0 || ref_pos_y >= 0) {
+                /* Project onto left column */
+                int abs_pos = ref_pos_y >> frac_bits;
+                int frac    = ref_pos_y & ((1 << frac_bits) - 1);
+                int idx0 = abs_pos + 1;  /* +1 because ref_left[0] = above-left */
+
+                int p0 = ref_left[tc_clip(idx0, 0, max_idx)];
+                int p1 = ref_left[tc_clip(idx0 + 1, 0, max_idx)];
+
+                int pred = p0 + (((p1 - p0) * frac + (1 << (frac_bits - 1))) >> frac_bits);
+                dst[y * dst_stride + x] = (tc_pixel_t)tc_clip(pred, 0, 255);
+            } else {
+                /* Projection goes above the left column — use above row */
+                int abs_pos = (-ref_pos_y) >> frac_bits;
+                int frac    = (-ref_pos_y) & ((1 << frac_bits) - 1);
+                int idx0 = abs_pos + 1;
+
+                int p0 = ref_above[tc_clip(idx0, 0, max_idx)];
+                int p1 = ref_above[tc_clip(idx0 + 1, 0, max_idx)];
 
                 int pred = p0 + (((p1 - p0) * frac + (1 << (frac_bits - 1))) >> frac_bits);
                 dst[y * dst_stride + x] = (tc_pixel_t)tc_clip(pred, 0, 255);
@@ -236,10 +316,14 @@ void tc_intra_predict(tc_pixel_t *TCODEC_RESTRICT dst, int dst_stride,
         intra_dc(dst, dst_stride, ref_above, ref_left, blk_size);
         break;
     default:
-        if (mode >= TC_INTRA_ANGULAR_START && mode < TC_INTRA_MAX) {
-            intra_angular(dst, dst_stride, ref_above, ref_left, blk_size, mode);
+        if (mode >= TC_INTRA_ANGULAR_START && mode < TC_INTRA_ANGULAR_VERT_END) {
+            /* Vertical angular modes 2..8 */
+            intra_angular_vert(dst, dst_stride, ref_above, ref_left, blk_size, mode);
+        } else if (mode >= TC_INTRA_ANGULAR_HORIZ_START && mode < TC_INTRA_MAX) {
+            /* Horizontal angular modes 9..17 */
+            intra_angular_horiz(dst, dst_stride, ref_above, ref_left, blk_size, mode);
         } else {
-            /* Fallback to DC */
+            /* Fallback to DC for invalid modes */
             intra_dc(dst, dst_stride, ref_above, ref_left, blk_size);
         }
         break;

@@ -20,7 +20,7 @@ ARM NEON SIMD execution. Every algorithm choice prioritizes:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| 9-mode intra prediction | ✅ Done | Planar, DC, 7 angular |
+| 18-mode intra prediction | ✅ Done | Planar, DC, 7 vertical angular, 9 horizontal angular |
 | WHT 4×4 / 8×8 transform | ✅ Done | Self-inverse, uniform dequant |
 | Exp-Golomb coefficient coding | ✅ Done | tANS framework reserved |
 | Hierarchical hex motion search | ✅ Done | ±16/32/64 range by preset |
@@ -37,7 +37,7 @@ ARM NEON SIMD execution. Every algorithm choice prioritizes:
 | NEON color conversion | ✅ Done | 32-bit accumulation luma; scalar chroma/inverse |
 | NEON deblock | ✅ Done | Auto-dispatch on ARM |
 | NEON transform | ✅ Done | DCT + WHT, auto-dispatch on ARM |
-| WPP thread pool | 🔧 Infra | Pool created; parallel dispatch pending |
+| WPP thread pool | ✅ Done | Per-row bitstream buffers + tANS encoders, entry point table, sequential fallback |
 | B-frames | ❌ Planned | Bi-prediction, COLLOCATED_MV |
 | tANS context modeling | ❌ Planned | 16 contexts: 4 bands × 4 magnitude classes |
 | SAO filter | ❌ Planned | Post-deblock offset filter |

@@ -47,7 +47,7 @@ extern "C" {
 #define TC_MAX_WIDTH        4096
 #define TC_MAX_HEIGHT       4096
 #define TC_MIN_BLOCK        4
-#define TC_INTRA_MODES      9           /* Planar + DC + 7 angular */
+#define TC_INTRA_MODES      18          /* Planar + DC + 7 vertical angular + 9 horizontal angular */
 #define TC_REF_FRAMES       4           /* DPB size */
 #define TC_MV_PREC          4           /* Quarter-pel motion */
 #define TC_QP_MIN           0
@@ -92,9 +92,15 @@ typedef enum {
     TC_INTRA_PLANAR  = 0,
     TC_INTRA_DC      = 1,
     TC_INTRA_ANGULAR_START = 2,
-    /* Angular modes 2..8 map to directions:
-     * 2=NE, 3=NNE, 4=NNW, 5=N, 6=NWW, 7=NW, 8=WN */
-    TC_INTRA_MAX     = 9,
+    /* Vertical angular modes 2..8 (project onto above row):
+     * 2=NE(45°), 3=NNE(26°), 4=NNW(11°), 5=N(0°), 6=NWW(-11°), 7=NW(-26°), 8=WN(-45°) */
+    TC_INTRA_ANGULAR_VERT_END = 9,
+    /* Horizontal angular modes 9..17 (project onto left column):
+     * 9=EN(45°), 10=EEN(26°), 11=EE(N)(11°), 12=E(0°=horizontal),
+     * 13=WW(N)(-11°), 14=WWN(-26°), 15=WN(horiz)(-45°),
+     * 16=NNW(horiz, -56°), 17=NNE(horiz, 56°) */
+    TC_INTRA_ANGULAR_HORIZ_START = 9,
+    TC_INTRA_MAX     = 18,
 } tc_intra_mode_t;
 
 typedef enum {
@@ -191,6 +197,7 @@ typedef struct tc_frame_header {
 
 /* Frame header flags */
 #define TC_FLAG_KEY_FRAME   0x80
+#define TC_FLAG_WPP          0x40      /* WPP row entry points present */
 #define TC_FLAG_TILE_C_MASK 0x0C      /* tile_cols_log2 in bits 2-3 */
 #define TC_FLAG_TILE_R_MASK 0x03      /* tile_rows_log2 in bits 0-1 */
 

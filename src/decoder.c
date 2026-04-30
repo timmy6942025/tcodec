@@ -72,7 +72,8 @@ static tc_error_t read_frame_header(tc_bs_reader_t *bs, tc_frame_header_t *hdr)
 
 static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
                          int frame_x, int frame_y,
-                         int qp, tc_frame_type_t frame_type)
+                         int qp, tc_frame_type_t frame_type,
+                         tc_bs_reader_t *bs, tc_tans_dec_t *tans)
 {
     int blk_size = 8;
     int n_coeff  = 64;
@@ -88,7 +89,7 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
     int is_merge = 0;
     if (frame_type != TC_FRAME_KEY) {
         /* 2-bit mode: 0=skip, 1=inter, 2=intra, 3=merge */
-        uint32_t mode = tc_bs_reader_read_bits(&dec->bs, 2);
+        uint32_t mode = tc_bs_reader_read_bits(bs, 2);
         switch (mode) {
         case TC_MODE_SKIP:
             is_skip  = 1;
@@ -113,8 +114,8 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
 
     /* ── Intra mode + prediction ───────────────────────────── */
     if (is_intra) {
-        /* Read intra mode (4 bits = enough for 9 modes) */
-        uint32_t im = tc_bs_reader_read_bits(&dec->bs, 4);
+        /* Read intra mode (5 bits = enough for 18 modes) */
+        uint32_t im = tc_bs_reader_read_bits(bs, 5);
         if (im >= TC_INTRA_MODES) im = TC_INTRA_DC;
         intra_mode = (tc_intra_mode_t)im;
 
@@ -179,7 +180,7 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
             /* Skip/inter: read ref_idx + MVD from bitstream */
             uint32_t ref_idx = 0;
             if (frame_type != TC_FRAME_KEY) {
-                ref_idx = tc_bs_reader_read_bits(&dec->bs, 2);
+                ref_idx = tc_bs_reader_read_bits(bs, 2);
                 if (ref_idx >= TC_REF_FRAMES) ref_idx = 0;  /* Safety clamp */
             }
             block_ref_idx = (uint8_t)ref_idx;  /* Save for ctu_data */
@@ -218,8 +219,8 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
                 }
             }
 
-            int32_t mvd_x = tc_bs_reader_read_se(&dec->bs);
-            int32_t mvd_y = tc_bs_reader_read_se(&dec->bs);
+            int32_t mvd_x = tc_bs_reader_read_se(bs);
+            int32_t mvd_y = tc_bs_reader_read_se(bs);
             mv = (tc_mv_s){ mvd_x + predictor_mv.x, mvd_y + predictor_mv.y };
             selected_ref = dec->dpb[ref_idx].frame;
         }
@@ -258,13 +259,13 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
         }
     } else {
         /* Non-skip: read DCT size flag + coefficients + reconstruct */
-        uint32_t dct_size_id = tc_bs_reader_read_bits(&dec->bs, 1);
+        uint32_t dct_size_id = tc_bs_reader_read_bits(bs, 1);
 
         if (dct_size_id == TC_BLOCK_4x4_ID) {
             for (int sy = 0; sy < 2; sy++) {
                 for (int sx = 0; sx < 2; sx++) {
                     tc_coeff_t sub[16];
-                    tc_tans_dec_coeffs(&dec->tans, sub, 16, TC_BLOCK_4x4_ID);
+                    tc_tans_dec_coeffs(tans, sub, 16, TC_BLOCK_4x4_ID);
                     for (int i = 0; i < 16; i++) {
                         int band = tc_freq_band(i, 4);
                         int w = tc_jnd_weight(band, i);
@@ -291,7 +292,7 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
                 }
             }
         } else {
-            tc_tans_dec_coeffs(&dec->tans, dct_coeff, 64, TC_BLOCK_8x8_ID);
+            tc_tans_dec_coeffs(tans, dct_coeff, 64, TC_BLOCK_8x8_ID);
             for (int i = 0; i < 64; i++) {
                 int band = tc_freq_band(i, 8);
                 int w = tc_jnd_weight(band, i);
@@ -383,7 +384,7 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
              * in tc_quantize/tc_dequantize, this decoder path must be updated
              * to apply matching JND weighting (like the luma path does inline). */
             tc_coeff_t c_coeff[16];
-            tc_tans_dec_coeffs(&dec->tans, c_coeff, 16, TC_BLOCK_4x4_ID);
+            tc_tans_dec_coeffs(tans, c_coeff, 16, TC_BLOCK_4x4_ID);
             tc_dequantize(c_coeff, 16, chroma_qp, 0);
 
             tc_coeff_t c_rec[16];
@@ -413,6 +414,60 @@ static void decode_block(tc_decoder_t *dec, int ctu_idx, int blk_idx,
         bi->ref_idx = block_ref_idx;  /* Actual ref_idx for skip/inter, 0 for merge */
     }
 }
+
+/* ── Decode one CTU row ───────────────────────────────────── */
+
+static void decode_row_impl(tc_decoder_t *dec, int row, int qp,
+                             tc_frame_type_t frame_type,
+                             tc_bs_reader_t *bs, tc_tans_dec_t *tans)
+{
+    for (int col = 0; col < dec->num_ctu_cols; col++) {
+        int ctu_x = col * TC_CTU_SIZE;
+        int ctu_y = row * TC_CTU_SIZE;
+        int ctu_idx = row * dec->num_ctu_cols + col;
+
+        /* For each 8×8 block in CTU */
+        for (int by = 0; by < TC_CTU_SIZE / 8; by++) {
+            for (int bx = 0; bx < TC_CTU_SIZE / 8; bx++) {
+                int blk_x = ctu_x + bx * 8;
+                int blk_y = ctu_y + by * 8;
+
+                if (blk_x + 8 > dec->width || blk_y + 8 > dec->height) continue;
+
+                decode_block(dec, ctu_idx, by * 8 + bx, blk_x, blk_y,
+                             qp, frame_type, bs, tans);
+            }
+        }
+
+        /* Deblock this CTU */
+        if (ctu_x + TC_CTU_SIZE <= dec->width &&
+            ctu_y + TC_CTU_SIZE <= dec->height) {
+            tc_deblock_ctu(dec->cur->y, dec->cur->stride_y,
+                           dec->cur->cb, dec->cur->stride_c,
+                           dec->cur->cr, dec->cur->stride_c,
+                           ctu_x, ctu_y, qp);
+        }
+    }
+}
+
+#if !defined(TCODEC_NO_THREADS)
+/* WPP thread pool wrapper matching tc_wpp_row_func signature.
+ * Each thread picks its per-row reader/tans by row index. */
+typedef struct {
+    tc_decoder_t   *dec;
+    int             qp;
+    tc_frame_type_t frame_type;
+    tc_bs_reader_t *row_bs;      /* Per-row reader array */
+    tc_tans_dec_t  *row_tans;    /* Per-row tANS decoder array */
+} dec_wpp_ctx_t;
+
+static void decode_row_wpp(void *ctx, int row)
+{
+    dec_wpp_ctx_t *wctx = (dec_wpp_ctx_t *)ctx;
+    decode_row_impl(wctx->dec, row, wctx->qp, wctx->frame_type,
+                    &wctx->row_bs[row], &wctx->row_tans[row]);
+}
+#endif /* !TCODEC_NO_THREADS */
 
 /* ── Decoder create/destroy ──────────────────────────────────── */
 
@@ -445,6 +500,17 @@ tc_decoder_t *tc_decoder_create(int32_t width, int32_t height)
         dec->dpb[i].poc = -1;
     }
 
+#if !defined(TCODEC_NO_THREADS)
+    /* Allocate thread pool and per-row readers for WPP.
+     * Actual WPP activation depends on the per-frame header TC_FLAG_WPP,
+     * but we pre-allocate the infrastructure at create time. */
+    dec->num_threads = 4;  /* Default for ARM quad-core */
+    dec->use_wpp = 0;      /* Will be set per-frame based on header flag */
+    dec->pool = tc_threadpool_create(dec->num_threads);
+    dec->row_bs   = NULL;  /* Allocated per-frame when WPP is active */
+    dec->row_tans = NULL;
+#endif
+
     return dec;
 }
 
@@ -456,6 +522,11 @@ void tc_decoder_destroy(tc_decoder_t *dec)
         tc_frame_free(dec->dpb[i].frame);
     }
     free(dec->ctu_data);
+#if !defined(TCODEC_NO_THREADS)
+    free(dec->row_bs);
+    free(dec->row_tans);
+    tc_threadpool_destroy(dec->pool);
+#endif
     free(dec);
 }
 
@@ -519,40 +590,142 @@ tc_error_t tc_decoder_decode(tc_decoder_t *dec,
     }
 
     /* CTU grid */
-    int num_ctu_cols = (hdr.width  + TC_CTU_SIZE - 1) / TC_CTU_SIZE;
     int num_ctu_rows = (hdr.height + TC_CTU_SIZE - 1) / TC_CTU_SIZE;
 
-    /* Decode CTU rows — DCT size flag is now read inside decode_block
-     * (after mode decision, matching encoder layout) */
-    for (int row = 0; row < num_ctu_rows; row++) {
-        for (int col = 0; col < num_ctu_cols; col++) {
-            int ctu_x = col * TC_CTU_SIZE;
-            int ctu_y = row * TC_CTU_SIZE;
-            int ctu_idx = row * num_ctu_cols + col;
+    /* Check for WPP entry point table in bitstream.
+     * When TC_FLAG_WPP is set, the bitstream contains an entry point
+     * table between header and row data. We MUST parse it even when
+     * we can't use WPP dispatch (e.g., no thread pool), so the reader
+     * is positioned correctly for sequential decoding. */
+    int is_wpp = (hdr.flags & TC_FLAG_WPP) != 0;
+    size_t row_data_start = 0;  /* Byte offset where row data begins */
+    size_t row_offsets[64];     /* Max CTU rows: 4096/64 = 64 */
+    int have_row_offsets = 0;
 
-            /* For each 8×8 block in CTU */
-            for (int by = 0; by < TC_CTU_SIZE / 8; by++) {
-                for (int bx = 0; bx < TC_CTU_SIZE / 8; bx++) {
-                    int blk_x = ctu_x + bx * 8;
-                    int blk_y = ctu_y + by * 8;
+    if (is_wpp) {
+        /* Parse entry point table — MUST happen regardless of whether
+         * WPP dispatch is available, so the reader advances past it. */
+        uint32_t num_offsets = tc_bs_reader_read_bits(&dec->bs, 16);
+        if (num_offsets > 63) return TC_ERR_BITSTREAM;  /* Sanity check */
 
-                    if (blk_x + 8 > hdr.width || blk_y + 8 > hdr.height) continue;
+        row_offsets[0] = 0;  /* Row 0 always starts at beginning of row data */
+        for (uint32_t i = 0; i < num_offsets && i < 63; i++) {
+            row_offsets[i + 1] = (size_t)tc_bs_reader_read_bits(&dec->bs, 16);
+        }
 
-                    decode_block(dec, ctu_idx, by * 8 + bx, blk_x, blk_y,
-                                 qp, hdr.frame_type);
+        /* Byte-align reader to skip padding after entry point table.
+         * The entry point table starts at a byte-aligned position (after header),
+         * and 16-bit reads preserve alignment. But there may be explicit
+         * byte-align padding from the encoder. Advance to next byte boundary. */
+        if (dec->bs.bit_pos > 0) {
+            dec->bs.byte_pos++;
+            dec->bs.bit_pos = 0;
+        }
+        row_data_start = dec->bs.byte_pos;
+
+        /* Bounds-check row offsets against input size */
+        for (int i = 0; i <= (int)num_offsets && i < num_ctu_rows; i++) {
+            if (row_data_start + row_offsets[i] > size) {
+                return TC_ERR_BITSTREAM;
+            }
+        }
+        have_row_offsets = 1;
+    }
+
+    /* Decode CTU rows with WPP parallelism or sequential fallback */
+    int use_wpp = 0;
+
+#if !defined(TCODEC_NO_THREADS)
+    use_wpp = is_wpp && have_row_offsets && dec->pool && num_ctu_rows > 1;
+
+    if (use_wpp) {
+        /* WPP mode: initialize per-row readers from entry point offsets
+         * and dispatch via thread pool.
+         *
+         * IMPORTANT: wctx is read-only during tc_threadpool_run.
+         * Worker threads only read dec/qp/frame_type/row_bs/row_tans —
+         * they never modify wctx. This is safe for concurrent access. */
+
+        /* Allocate per-row readers and tANS decoders for this frame */
+        free(dec->row_bs);
+        free(dec->row_tans);
+        dec->row_bs   = (tc_bs_reader_t *)calloc((size_t)num_ctu_rows, sizeof(tc_bs_reader_t));
+        dec->row_tans = (tc_tans_dec_t *)calloc((size_t)num_ctu_rows, sizeof(tc_tans_dec_t));
+        if (!dec->row_bs || !dec->row_tans) {
+            free(dec->row_bs);
+            free(dec->row_tans);
+            dec->row_bs = NULL;
+            dec->row_tans = NULL;
+            use_wpp = 0;  /* Fall back to sequential */
+        } else {
+            /* Initialize each row's reader to point at its data within
+             * the input buffer. Each row's data starts at:
+             *   row_data_start + row_offsets[row]
+             * The size extends to the next row's start (or end of data). */
+            for (int row = 0; row < num_ctu_rows; row++) {
+                size_t row_start = row_data_start + row_offsets[row];
+                size_t row_end;
+                if (row + 1 < num_ctu_rows) {
+                    row_end = row_data_start + row_offsets[row + 1];
+                } else {
+                    row_end = size;  /* Last row extends to end of data */
                 }
+                tc_bs_reader_init(&dec->row_bs[row],
+                                  data + row_start,
+                                  row_end - row_start);
+                tc_tans_dec_init(&dec->row_tans[row], &dec->row_bs[row]);
             }
 
-            /* Deblock this CTU */
-            if (ctu_x + TC_CTU_SIZE <= hdr.width &&
-                ctu_y + TC_CTU_SIZE <= hdr.height) {
-                tc_deblock_ctu(dec->cur->y, dec->cur->stride_y,
-                               dec->cur->cb, dec->cur->stride_c,
-                               dec->cur->cr, dec->cur->stride_c,
-                               ctu_x, ctu_y, qp);
+            /* Dispatch WPP via thread pool */
+            dec_wpp_ctx_t wctx;
+            wctx.dec        = dec;
+            wctx.qp         = qp;
+            wctx.frame_type = hdr.frame_type;
+            wctx.row_bs     = dec->row_bs;
+            wctx.row_tans   = dec->row_tans;
+            tc_threadpool_run(dec->pool, decode_row_wpp, &wctx, num_ctu_rows);
+        }
+    }
+#endif /* !TCODEC_NO_THREADS */
+
+    if (!use_wpp) {
+        /* Sequential: decode all rows from a single bitstream reader.
+         *
+         * For WPP bitstreams when threading is unavailable or WPP
+         * allocation failed, we must skip the entry point table and
+         * re-init the reader from row_data_start. Each row's data is
+         * byte-aligned, so the sequential reader advances past row
+         * boundaries correctly (padding bytes between rows are consumed
+         * naturally as the reader moves forward). */
+        if (is_wpp && have_row_offsets) {
+            tc_bs_reader_init(&dec->bs, data + row_data_start, size - row_data_start);
+            tc_tans_dec_init(&dec->tans, &dec->bs);
+        }
+
+        for (int row = 0; row < num_ctu_rows; row++) {
+            decode_row_impl(dec, row, qp, hdr.frame_type,
+                            &dec->bs, &dec->tans);
+            /* WPP rows are byte-aligned — skip padding to reach
+             * the next row's start. Without this, the reader would
+             * misinterpret padding bits as block data.
+             *
+             * TODO: When real tANS is implemented (Phase 3), this
+             * sequential WPP fallback must also re-init tANS per row
+             * to match the encoder's per-row tANS entry points.
+             * Currently safe because tANS is Exp-Golomb (stateless). */
+            if (is_wpp && row + 1 < num_ctu_rows) {
+                if (dec->bs.bit_pos > 0) {
+                    dec->bs.byte_pos++;
+                    dec->bs.bit_pos = 0;
+                }
             }
         }
     }
+
+    (void)have_row_offsets;
+    (void)row_data_start;
+    (void)is_wpp;
+    (void)use_wpp;
 
     /* Update DPB: shift entries and insert new frame at slot 0.
      * IMPORTANT: Must free oldest entry BEFORE struct copy loop,

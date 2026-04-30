@@ -23,7 +23,7 @@
 - [ ] **ACT-4**: Wire NEON inter predict — `tc_inter_predict_neon()` exists but uses bilinear (not 6-tap). **Deferred** — scalar `tc_inter_predict()` uses proper 6-tap luma filter with bilinear fallback; NEON version would reduce quality. Needs rewrite to match 6-tap behavior.
 - [x] **ACT-5**: Wire NEON deblock — ✅ Wired: scalar `tc_deblock_ctu()` guarded by `#if !TCODEC_NEON`; NEON `tc_deblock_ctu()` replaces it on ARM. ⚠️ NEON version uses weak-only filter (no strong mode) and 8px boundaries (vs 4px) — different behavior from scalar.
 - [x] **ACT-6**: Wire NEON color convert — ✅ Wired: NEON luma with 32-bit accumulation (fixed int16 overflow); chroma/inverse match scalar for roundtrip correctness. Scalar `_internal` functions guarded by `#if !TCODEC_NEON`; public API wrappers always compiled.
-- [ ] **ACT-7**: Wire WPP thread pool — encoder/decoder loops are sequential `for (row = 0; ...)`. Thread pool infrastructure exists in `threadpool.c`. Needs row-dependency synchronization. **Not yet wired.**
+- [x] **ACT-7**: Wire WPP thread pool — ✅ Wired: encoder uses per-row bitstream buffers + tANS encoders, dispatches via `tc_threadpool_run()`, merges byte-aligned row bitstreams with entry point table. Decoder reads entry point table when `TC_FLAG_WPP` is set, initializes per-row readers, dispatches WPP. Sequential fallback with inter-row byte-alignment skips. `TCODEC_NO_THREADS` compatible.
 
 ---
 
@@ -140,8 +140,9 @@
   - [ ] Quadtree partitioning (64→32→16→8)
   - [ ] Quadtree + binary splits (QTBT)
   - [ ] Restricted partition grammar for decoder simplicity
-- [ ] Expand intra mode set beyond 9 modes:
-  - [ ] 33+ angular modes (HEVC-style)
+- [x] Expand intra mode set beyond 9 modes (partial — 18 modes done):
+  - [x] 18 angular modes (7 vertical + 9 horizontal + planar + DC)
+  - [ ] 33+ angular modes (HEVC-style full set)
   - [ ] LM (chroma-from-luma) prediction
   - [ ] DM (direct mode — use luma mode for chroma)
   - [ ] Wide-angle intra modes for non-square blocks
@@ -149,7 +150,7 @@
   - [ ] Intra smoothing rules (filter reference samples)
   - [ ] PDPC (position-dependent intra prediction combining)
   - [ ] MRL (multiple reference line intra prediction)
-- [ ] Block skip and zero-residual signaling
+- [x] Block skip and zero-residual signaling (skip/merge modes)
 - [ ] Fast encoder pruning heuristics (RD-cost based)
 - [ ] Cache-friendly candidate ordering
 - [ ] Verify: material gain on high-detail still regions and low-motion scenes
@@ -313,7 +314,7 @@ The recommended execution order (highest impact first):
 15. **Film grain strategy** — Major win for movies
 16. **Mature rate control** — Lookahead, VBV, perceptual
 17. **NEON inter predict rewrite** — Match 6-tap behavior (ACT-4 deferred due to quality mismatch)
-18. **WPP thread pool wiring** — ACT-7: row-dependency sync needed
+18. ~~**WPP thread pool wiring**~~ — ✅ ACT-7: WPP wired for encoder and decoder with entry point table
 19. **Full ARM NEON optimization** — Performance for deployment
 20. **Ecosystem** — FFmpeg, containers, streaming
 

@@ -255,70 +255,6 @@ void tc_ratectl_frame_start(tc_ratectl_t *rc, tc_frame_type_t type);
 int  tc_ratectl_get_qp(tc_ratectl_t *rc);
 void tc_ratectl_frame_end(tc_ratectl_t *rc, int64_t bits_used);
 
-/* ── Encoder internals ───────────────────────────────────────── */
-
-typedef struct tc_encoder {
-    tc_config_t       cfg;
-    tc_frame_buf_t   *cur;             /* Current input frame */
-    tc_frame_buf_t   *recon;           /* Reconstructed frame */
-    tc_ref_entry_t    dpb[TC_REF_FRAMES]; /* Decoded picture buffer */
-    tc_ratectl_t      rc;
-    tc_tans_enc_t     tans;
-    tc_bs_writer_t    bs;
-    tc_ctu_info_t    *ctu_data;        /* Per-CTU coding info array */
-    int              *ctu_row_start;   /* Bitstream offset per CTU row */
-    int32_t           num_ctu_cols;
-    int32_t           num_ctu_rows;
-    int32_t           frame_count;
-    int32_t           force_keyframe;
-    /* Thread pool for WPP (only when threading enabled) */
-#if !defined(TCODEC_NO_THREADS)
-    pthread_t        *threads;
-    int               num_threads;
-    pthread_mutex_t   row_mutex;
-    pthread_cond_t    row_cond;
-    int              *row_done;        /* Per-row completion flag */
-#endif
-    /* Stats */
-    int64_t           total_bytes;
-    int32_t           total_frames;
-    double            sum_psnr;
-    /* Bitstream output buffer */
-    uint8_t          *out_buf;
-    size_t            out_buf_size;
-} tc_encoder_t;
-
-/* ── Decoder internals ───────────────────────────────────────── */
-
-typedef struct tc_decoder {
-    int32_t           width;
-    int32_t           height;
-    tc_frame_buf_t   *cur;             /* Current reconstructed frame */
-    tc_ref_entry_t    dpb[TC_REF_FRAMES];
-    tc_tans_dec_t     tans;
-    tc_bs_reader_t    bs;
-    tc_ctu_info_t    *ctu_data;
-    int32_t           num_ctu_cols;
-    int32_t           num_ctu_rows;
-    int32_t           prev_qp;
-    /* Thread pool for WPP (only when threading enabled) */
-#if !defined(TCODEC_NO_THREADS)
-    pthread_t        *threads;
-    int               num_threads;
-    pthread_mutex_t   row_mutex;
-    pthread_cond_t    row_cond;
-    int              *row_done;
-#endif
-    /* Output packet info */
-    tc_frame_header_t last_header;
-} tc_decoder_t;
-
-/* ── PSNR computation ────────────────────────────────────────── */
-
-double tc_psnr(const tc_pixel_t *a, int stride_a,
-               const tc_pixel_t *b, int stride_b,
-               int width, int height);
-
 /* ── Thread pool for WPP ─────────────────────────────────────── */
 
 #if !defined(TCODEC_NO_THREADS)
@@ -346,6 +282,74 @@ void             tc_threadpool_run(tc_threadpool_t *pool,
                                     int total_rows);
 
 #endif /* TCODEC_NO_THREADS */
+
+/* ── Encoder internals ───────────────────────────────────────── */
+
+typedef struct tc_encoder {
+    tc_config_t       cfg;
+    tc_frame_buf_t   *cur;             /* Current input frame */
+    tc_frame_buf_t   *recon;           /* Reconstructed frame */
+    tc_ref_entry_t    dpb[TC_REF_FRAMES]; /* Decoded picture buffer */
+    tc_ratectl_t      rc;
+    tc_tans_enc_t     tans;
+    tc_bs_writer_t    bs;
+    tc_ctu_info_t    *ctu_data;        /* Per-CTU coding info array */
+    int32_t           num_ctu_cols;
+    int32_t           num_ctu_rows;
+    int32_t           frame_count;
+    int32_t           force_keyframe;
+    /* Thread pool for WPP (only when threading enabled) */
+#if !defined(TCODEC_NO_THREADS)
+    tc_threadpool_t  *pool;
+    /* Per-row bitstream buffers for WPP parallelism.
+     * Each WPP thread writes to its own row_bs/row_tans,
+     * then rows are merged into the main bitstream in order. */
+    tc_bs_writer_t   *row_bs;
+    tc_tans_enc_t    *row_tans;
+    uint8_t         **row_buf;         /* Per-row output buffer pointers */
+    size_t           *row_buf_size;    /* Per-row output buffer sizes */
+    int               num_threads;     /* Number of WPP worker threads */
+    int               use_wpp;        /* 1 = use WPP, 0 = sequential */
+#endif
+    /* Stats */
+    int64_t           total_bytes;
+    int32_t           total_frames;
+    double            sum_psnr;
+    /* Bitstream output buffer */
+    uint8_t          *out_buf;
+    size_t            out_buf_size;
+} tc_encoder_t;
+
+/* ── Decoder internals ───────────────────────────────────────── */
+
+typedef struct tc_decoder {
+    int32_t           width;
+    int32_t           height;
+    tc_frame_buf_t   *cur;             /* Current reconstructed frame */
+    tc_ref_entry_t    dpb[TC_REF_FRAMES];
+    tc_tans_dec_t     tans;
+    tc_bs_reader_t    bs;
+    tc_ctu_info_t    *ctu_data;
+    int32_t           num_ctu_cols;
+    int32_t           num_ctu_rows;
+    int32_t           prev_qp;
+    /* Thread pool for WPP (only when threading enabled) */
+#if !defined(TCODEC_NO_THREADS)
+    tc_threadpool_t  *pool;
+    tc_bs_reader_t   *row_bs;          /* Per-row bitstream readers */
+    tc_tans_dec_t    *row_tans;        /* Per-row tANS decoders */
+    int               num_threads;     /* Number of WPP worker threads */
+    int               use_wpp;        /* 1 = use WPP, 0 = sequential */
+#endif
+    /* Output packet info */
+    tc_frame_header_t last_header;
+} tc_decoder_t;
+
+/* ── PSNR computation ────────────────────────────────────────── */
+
+double tc_psnr(const tc_pixel_t *a, int stride_a,
+               const tc_pixel_t *b, int stride_b,
+               int width, int height);
 
 #ifdef __cplusplus
 }
